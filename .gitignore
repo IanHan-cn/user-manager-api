@@ -1,0 +1,61 @@
+# 构建产物
+bin/
+dist/
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+
+# 测试与覆盖率输出
+*.test
+coverage*
+*.cover
+
+# 本地配置与密钥（保留示例文件）
+.env
+*.env
+.env.*
+!.env.example
+*.local
+*.local.*
+
+# 日志与临时文件
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Go 编译缓存与工作区文件
+/debug/
+go.work
+go.work.sum
+
+# 依赖目录
+vendor/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# AI 工具本地产物
+.claude
+.reports/
+.roo/
+REVIEW-*.md
