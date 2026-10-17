@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,11 +26,27 @@ func main() {
 		os.Exit(runHealthcheck())
 	}
 
-	_, err := bootstrap.Build()
-	if err != nil {
+	// 由 run 承载 defer，确保任何返回路径都能释放资源（os.Exit 会跳过 defer）。
+	if err := run(); err != nil {
 		slog.Error("service failed to start", "error", err)
 		os.Exit(1)
 	}
+}
+
+// run 装配并运行服务，返回前保证资源已释放。
+func run() error {
+	app, err := bootstrap.Build()
+	if err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	defer func() {
+		if cerr := app.Close(); cerr != nil {
+			slog.Error("failed to release resources", "error", cerr)
+		}
+	}()
+
+	// Run 阻塞直到收到中断信号并完成优雅关闭。
+	return app.Run()
 }
 
 // runHealthcheck 请求本地就绪检查端点，返回进程退出码。
