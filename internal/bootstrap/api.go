@@ -49,7 +49,7 @@ func Build() (*Bootstrap, error) {
 	// TODO(redis): 待引入缓存/会话需求后在此初始化 Redis 客户端，并纳入 Close 释放。
 
 	// 初始化 Casbin
-	enforcer, err := NewCasbin(db)
+	enforcer, err := InitializeCasbin(db)
 	if err != nil {
 		closeDB(db)
 		return nil, fmt.Errorf("initialize casbin: %w", err)

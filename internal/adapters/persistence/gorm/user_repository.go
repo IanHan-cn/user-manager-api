@@ -30,7 +30,8 @@ var _ ports.UserRepository = (*UserRepository)(nil)
 
 func (r *UserRepository) FindByID(ctx context.Context, id string) (*domain.User, error) {
 	var user domain.User
-	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&user).Error; err != nil {
+	db := dBFromContext(ctx, r.db)
+	if err := db.WithContext(ctx).Where("id = ?", id).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}

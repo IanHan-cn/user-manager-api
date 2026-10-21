@@ -42,6 +42,14 @@ type Config struct {
 
 	Database DatabaseConfig
 	HTTP     HTTPConfig
+	Zitadel  ZitadelConfig
+}
+type ZitadelConfig struct {
+	Domain string
+	Key    string // 任意 32 字节密钥
+
+	ClientID    string
+	RedirectURI string
 }
 type HTTPConfig struct {
 	Addr              string
@@ -66,6 +74,16 @@ func Load() (Config, error) {
 	if os.Getenv("AppEnv") != AppEnvProduction {
 		slog.Error("failed to load .env file", "error", envError)
 	}
+	// zitadel
+	zitadelCfg := ZitadelConfig{
+		Domain:      envOrDefault("ZITADEL_DOMAIN", ""),
+		Key:         envOrDefault("ZITADEL_KEY", ""), // 任意 32 字节密钥
+		ClientID:    envOrDefault("ZITADEL_CLIENT_ID", ""),
+		RedirectURI: envOrDefault("ZITADEL_REDIRECT_URI", ""),
+	}
+	if zitadelCfg.Domain == "" || zitadelCfg.Key == "" || zitadelCfg.ClientID == "" || zitadelCfg.RedirectURI == "" {
+		return Config{}, fmt.Errorf("zitadel config is incomplete")
+	}
 
 	// DB
 	dbCfg := DatabaseConfig{
@@ -89,6 +107,7 @@ func Load() (Config, error) {
 		LogLevel: envOrDefault("LogLevel", defaultLogLevel),
 		Database: dbCfg,
 		HTTP:     httpCfg,
+		Zitadel:  zitadelCfg,
 	}
 	return cfg, nil
 }

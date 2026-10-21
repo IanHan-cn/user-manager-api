@@ -1,0 +1,61 @@
+package authentication
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"github.com/memories-cn/user-management-api/internal/config"
+	"github.com/memories-cn/user-management-api/internal/ports"
+	"github.com/zitadel/zitadel-go/v3/pkg/authentication"
+	openid "github.com/zitadel/zitadel-go/v3/pkg/authentication/oidc"
+	"github.com/zitadel/zitadel-go/v3/pkg/zitadel"
+)
+
+type zitadelAuthenticator struct {
+	authN *authentication.Authenticator[*openid.DefaultContext]
+}
+
+func New(cfg config.ZitadelConfig) (ports.Authenticator, error) {
+	ctx := context.Background()
+	domain := cfg.Domain
+	key := cfg.Key
+	clientID := cfg.ClientID
+	redirectURI := cfg.RedirectURI
+
+	authN, err := authentication.New(ctx, zitadel.New(domain), key,
+		openid.DefaultAuthentication(clientID, redirectURI, key),
+		// 可选：authentication.WithPostLogoutRedirectURI("http://localhost:8089/"),
+		// 可选：authentication.WithCookieSession[*oidc.DefaultContext](), // 无状态会话
+		// 可选：authentication.WithExternalSecure(true),                  // 反代 https 后面
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create ZITADEL authenticator: %w", err)
+	}
+	return &zitadelAuthenticator{authN: authN}, nil
+}
+
+func (a *zitadelAuthenticator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	a.authN.ServeHTTP(w, r)
+}
+
+func (a *zitadelAuthenticator) Authenticate(w http.ResponseWriter, r *http.Request, requestedURI string) {
+	a.authN.Authenticate(w, r, requestedURI)
+}
+
+func (a *zitadelAuthenticator) Principal(r *http.Request) (ports.Principal, error) {
+	authCtx, err := a.authN.IsAuthenticated(r)
+	if err != nil {
+		return ports.Principal{}, fmt.Errorf("check ZITADEL session: %w", err)
+	}
+	if authCtx == nil {
+		return ports.Principal{}, fmt.Errorf("ZITADEL session is empty")
+	}
+
+	userInfo := authCtx.GetUserInfo()
+	if userInfo == nil || userInfo.GetSubject() == "" {
+		return ports.Principal{}, fmt.Errorf("ZITADEL user subject is empty")
+	}
+
+	return ports.Principal{Subject: userInfo.GetSubject()}, nil
+}

@@ -27,5 +27,7 @@ func NewRouter(deps Deps) *gin.Engine {
 	r.GET("/health/live", health.Live)
 	r.GET("/health/ready", health.Ready)
 
+	v1 := r.Group("/api/v1")
+
 	return r
 }

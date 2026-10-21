@@ -14,10 +14,7 @@ type Service struct {
 	tx   ports.Transactor
 }
 
-func NewService(
-	repo ports.UserRepository,
-	tx ports.Transactor,
-) (*Service, error) {
+func NewService(repo ports.UserRepository, tx ports.Transactor) (*Service, error) {
 	if repo == nil {
 		return nil, ErrMissingRepository
 	}
@@ -25,8 +22,5 @@ func NewService(
 		return nil, errors.New("transactor is required")
 	}
 
-	return &Service{
-		repo: repo,
-		tx:   tx,
-	}, nil
+	return &Service{repo: repo, tx: tx}, nil
 }

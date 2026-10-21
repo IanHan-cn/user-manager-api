@@ -13,7 +13,7 @@ import (
 //go:embed rbac_with_domains_model.conf
 var configFS embed.FS
 
-func NewCasbin(db *gorm.DB) (*casbin.Enforcer, error) {
+func InitializeCasbin(db *gorm.DB) (*casbin.Enforcer, error) {
 	// 创建 Casbin GORM adapter，使用 PostgreSQL 作为策略存储。
 	adapter, err := gormadapter.NewAdapterByDB(db)
 	if err != nil {
