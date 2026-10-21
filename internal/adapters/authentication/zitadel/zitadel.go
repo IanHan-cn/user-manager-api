@@ -1,4 +1,7 @@
-package authentication
+// Package zitadel 是 ZITADEL 认证能力的适配器实现。
+// 整个仓库中只有本包直接依赖 zitadel-go，
+// 对外一律以 ports.Authenticator 端口暴露。
+package zitadel
 
 import (
 	"context"
@@ -15,6 +18,10 @@ import (
 type zitadelAuthenticator struct {
 	authN *authentication.Authenticator[*openid.DefaultContext]
 }
+
+// 编译期断言：本适配器必须完整实现 ports.Authenticator 端口。
+// 接口方法集一旦变动，这里会立即编译失败，而不是等到运行时才发现。
+var _ ports.Authenticator = (*zitadelAuthenticator)(nil)
 
 func New(cfg config.ZitadelConfig) (ports.Authenticator, error) {
 	ctx := context.Background()

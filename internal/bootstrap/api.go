@@ -10,6 +10,7 @@ import (
 	"github.com/casbin/casbin/v3"
 	"github.com/gin-gonic/gin"
 	"github.com/lmittmann/tint"
+	zitadelauth "github.com/memories-cn/user-management-api/internal/adapters/authentication/zitadel"
 	ginrouter "github.com/memories-cn/user-management-api/internal/adapters/inbound/http/gin"
 	"github.com/memories-cn/user-management-api/internal/config"
 	"gorm.io/gorm"
@@ -71,9 +72,18 @@ func Build() (*Bootstrap, error) {
 	//   userSvc, err := user.NewService(userRepo, tx)
 	//   if err != nil { closeDB(db); return nil, err }
 
+	// 初始化认证适配器：ZITADEL 是当前唯一的认证实现，
+	// 对外只以 ports.Authenticator 端口注入。
+	auth, err := zitadelauth.New(cfg.Zitadel)
+	if err != nil {
+		closeDB(db)
+		return nil, fmt.Errorf("initialize zitadel authenticator: %w", err)
+	}
+
 	// 创建 Gin Router：契约由 router 包声明，这里只负责填充。
 	router := ginrouter.NewRouter(ginrouter.Deps{
 		Readiness: readiness,
+		Auth:      auth,
 		// Users: userSvc,
 	})
 
