@@ -79,6 +79,6 @@ func newV1Group(r *gin.Engine, a ports.Authenticator) *gin.RouterGroup {
 // 否则容易绕过这里的认证中间件与统一响应格式。
 func registerV1(v1 *gin.RouterGroup, deps Deps) {
 	// TODO(user): user handler 就绪后在此追加，例如：
-	//   v1.GET("/users", handlers.NewUserHandler(deps.Users).List)
-
+	users := handlers.NewUsersHandler()
+	v1.GET("/user", users.GetUsersList)
 }

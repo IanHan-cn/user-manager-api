@@ -10,6 +10,7 @@ import (
 
 	"github.com/memories-cn/user-management-api/internal/config"
 	"github.com/memories-cn/user-management-api/internal/ports"
+	"github.com/redis/go-redis/v9"
 	"github.com/zitadel/zitadel-go/v3/pkg/authentication"
 	openid "github.com/zitadel/zitadel-go/v3/pkg/authentication/oidc"
 	"github.com/zitadel/zitadel-go/v3/pkg/zitadel"
@@ -23,7 +24,7 @@ type zitadelAuthenticator struct {
 // 接口方法集一旦变动，这里会立即编译失败，而不是等到运行时才发现。
 var _ ports.Authenticator = (*zitadelAuthenticator)(nil)
 
-func New(cfg config.ZitadelConfig) (ports.Authenticator, error) {
+func New(cfg config.ZitadelConfig, redisClient *redis.Client) (ports.Authenticator, error) {
 	ctx := context.Background()
 	domain := cfg.Domain
 	key := cfg.Key
@@ -32,6 +33,9 @@ func New(cfg config.ZitadelConfig) (ports.Authenticator, error) {
 
 	authN, err := authentication.New(ctx, zitadel.New(domain), key,
 		openid.DefaultAuthentication(clientID, redirectURI, key),
+		// WithSessionStore 需要的是 authentication.Sessions[*openid.DefaultContext]，
+		// 会话类型与上面 DefaultAuthentication 推导出的 Authenticator 类型参数保持一致。
+		authentication.WithSessionStore(NewRedisSessionStore[*openid.DefaultContext](redisClient, cfg)),
 		// 可选：authentication.WithPostLogoutRedirectURI("http://localhost:8089/"),
 		// 可选：authentication.WithCookieSession[*oidc.DefaultContext](), // 无状态会话
 		// 可选：authentication.WithExternalSecure(true),                  // 反代 https 后面

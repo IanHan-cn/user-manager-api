@@ -13,6 +13,7 @@ import (
 	zitadelauth "github.com/memories-cn/user-management-api/internal/adapters/authentication/zitadel"
 	ginrouter "github.com/memories-cn/user-management-api/internal/adapters/inbound/http/gin"
 	"github.com/memories-cn/user-management-api/internal/config"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
@@ -20,11 +21,12 @@ import (
 // 不承载用例依赖图（repository / service / handler），
 // 避免装配层退化成无所不包的容器。
 type Bootstrap struct {
-	cfg       config.Config
-	db        *gorm.DB
-	casbin    *casbin.Enforcer
-	router    *gin.Engine
-	readiness *ReadinessChecker
+	cfg         config.Config
+	db          *gorm.DB
+	redisClient *redis.Client
+	casbin      *casbin.Enforcer
+	router      *gin.Engine
+	readiness   *ReadinessChecker
 }
 
 // Build 按顺序完成：加载配置 → 初始化日志 → 设置 Gin 模式 →
@@ -48,6 +50,11 @@ func Build() (*Bootstrap, error) {
 	}
 
 	// TODO(redis): 待引入缓存/会话需求后在此初始化 Redis 客户端，并纳入 Close 释放。
+	redisClient, err := OpenRedis(cfg)
+	if err != nil {
+		closeDB(db)
+		return nil, fmt.Errorf("open redis: %w", err)
+	}
 
 	// 初始化 Casbin
 	enforcer, err := InitializeCasbin(db)
@@ -75,7 +82,7 @@ func Build() (*Bootstrap, error) {
 
 	// 初始化认证适配器：ZITADEL 是当前唯一的认证实现，
 	// 对外只以 ports.Authenticator 端口注入。
-	auth, err := zitadelauth.New(cfg.Zitadel)
+	auth, err := zitadelauth.New(cfg.Zitadel, redisClient)
 	if err != nil {
 		closeDB(db)
 		return nil, fmt.Errorf("initialize zitadel authenticator: %w", err)
@@ -90,11 +97,12 @@ func Build() (*Bootstrap, error) {
 	})
 
 	return &Bootstrap{
-		cfg:       cfg,
-		db:        db,
-		casbin:    enforcer,
-		router:    router,
-		readiness: readiness,
+		cfg:         cfg,
+		db:          db,
+		redisClient: redisClient,
+		casbin:      enforcer,
+		router:      router,
+		readiness:   readiness,
 	}, nil
 }
 
@@ -112,7 +120,14 @@ func (app *Bootstrap) Close() error {
 	if app.db != nil {
 		err = closeDB(app.db)
 	}
-	// TODO(redis): Redis 客户端就绪后在此一并关闭。
+	// Redis 客户端就绪后在此一并关闭。
+	if app.redisClient != nil {
+		if err := app.redisClient.Close(); err != nil {
+			slog.Error("failed to close redis client", "error", err)
+			err = fmt.Errorf("close redis client: %w", err)
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}

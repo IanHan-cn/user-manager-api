@@ -32,6 +32,14 @@ const (
 	defaultHTTPReadTimeout       = 15 * time.Second
 	defaultHTTPWriteTimeout      = 15 * time.Second
 	defaultHTTPIdleTimeout       = 60 * time.Second
+
+	// ZITADEL 会话在 Redis 中的存储参数。
+	// 与上面几组不同，这组默认值必须导出：会话存储在配置项为零值时
+	// 要能退回同一套值。一旦 TTL 退化为 0，go-redis 会当成永不过期，
+	// 会话键将永久驻留。
+	DefaultZitadelSessionKeyPrefix      = "zitadel:session:"
+	DefaultZitadelSessionFallbackTTL    = 24 * time.Hour
+	DefaultZitadelSessionRedisOpTimeout = 2 * time.Second
 )
 
 type Config struct {
@@ -41,6 +49,7 @@ type Config struct {
 	LogLevel string
 
 	Database DatabaseConfig
+	Redis    RedisConfig
 	HTTP     HTTPConfig
 	Zitadel  ZitadelConfig
 }
@@ -50,6 +59,15 @@ type ZitadelConfig struct {
 
 	ClientID    string
 	RedirectURI string
+
+	// 以下是会话在 Redis 中的存储参数。
+	// SessionKeyPrefix 会话键前缀，用于与 Redis 中的其它业务数据隔离。
+	SessionKeyPrefix string
+	// SessionFallbackTTL 是拿不到 ID Token 过期时间时的兜底有效期。
+	// 会话没有删除入口，写入时不给 TTL 就会永久驻留，因此不能留空。
+	SessionFallbackTTL time.Duration
+	// SessionRedisOpTimeout 限制单次 Redis 操作，防止 Redis 抖动拖垮认证链路。
+	SessionRedisOpTimeout time.Duration
 }
 type HTTPConfig struct {
 	Addr              string
@@ -69,6 +87,12 @@ type DatabaseConfig struct {
 	PingTimeout     time.Duration
 }
 
+type RedisConfig struct {
+	Addr     string
+	Password string
+	DB       int
+}
+
 func Load() (Config, error) {
 	envError := godotenv.Load()
 	if os.Getenv("AppEnv") != AppEnvProduction {
@@ -80,6 +104,10 @@ func Load() (Config, error) {
 		Key:         envOrDefault("ZITADEL_KEY", ""), // 任意 32 字节密钥
 		ClientID:    envOrDefault("ZITADEL_CLIENT_ID", ""),
 		RedirectURI: envOrDefault("ZITADEL_REDIRECT_URI", ""),
+
+		SessionKeyPrefix:      envOrDefault("ZITADEL_SESSION_KEY_PREFIX", DefaultZitadelSessionKeyPrefix),
+		SessionFallbackTTL:    envOrDefaultDuration("ZITADEL_SESSION_FALLBACK_TTL", DefaultZitadelSessionFallbackTTL),
+		SessionRedisOpTimeout: envOrDefaultDuration("ZITADEL_SESSION_REDIS_OP_TIMEOUT", DefaultZitadelSessionRedisOpTimeout),
 	}
 	if zitadelCfg.Domain == "" || zitadelCfg.Key == "" || zitadelCfg.ClientID == "" || zitadelCfg.RedirectURI == "" {
 		return Config{}, fmt.Errorf("zitadel config is incomplete")
@@ -94,6 +122,12 @@ func Load() (Config, error) {
 		ConnMaxIdleTime: envOrDefaultDuration("DatabaseConnMaxIdleTime", defaultDBConnMaxIdleTime),
 		PingTimeout:     envOrDefaultDuration("DatabasePingTimeout", defaultDBPingTimeout),
 	}
+	// redis
+	redisCfg := RedisConfig{
+		Addr:     envOrDefault("RedisAddr", "localhost:6379"),
+		Password: envOrDefault("RedisPassword", ""),
+		DB:       envOrDefaultInt("RedisDB", 0),
+	}
 	// HTTP
 	httpCfg := HTTPConfig{
 		Addr:              envOrDefault("HTTPAddr", defaultHTTPAddr),
@@ -106,6 +140,7 @@ func Load() (Config, error) {
 		AppEnv:   envOrDefault("AppEnv", defaultAppEnv),
 		LogLevel: envOrDefault("LogLevel", defaultLogLevel),
 		Database: dbCfg,
+		Redis:    redisCfg,
 		HTTP:     httpCfg,
 		Zitadel:  zitadelCfg,
 	}
