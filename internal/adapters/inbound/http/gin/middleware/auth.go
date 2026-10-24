@@ -15,7 +15,10 @@ import (
 func RequireAuth(a ports.Authenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		principal, err := a.Principal(c.Request)
-		if err != nil {
+		// 既要判错，也要判空 Subject：
+		// 端口契约允许实现返回 (零值, nil)，
+		// 若只判 err，这种"已认证但身份为空"会被误当成放行。
+		if err != nil || principal.Subject == "" {
 			// 认证失败（无会话、会话过期、身份不完整）都按未登录处理。
 			a.Authenticate(c.Writer, c.Request, c.Request.RequestURI)
 			c.Abort()
@@ -31,7 +34,7 @@ func RequireAuth(a ports.Authenticator) gin.HandlerFunc {
 // 适用于「登录后体验更好，但未登录同样可访问」的接口。
 func CheckAuth(a ports.Authenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if principal, err := a.Principal(c.Request); err == nil {
+		if principal, err := a.Principal(c.Request); err == nil && principal.Subject != "" {
 			c.Request = c.Request.WithContext(ports.WithPrincipal(c.Request.Context(), principal))
 		}
 		c.Next()

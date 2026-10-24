@@ -71,6 +71,7 @@ func Build() (*Bootstrap, error) {
 	//   tx := gormpersist.NewTransactor(db)
 	//   userSvc, err := user.NewService(userRepo, tx)
 	//   if err != nil { closeDB(db); return nil, err }
+	// 用例就绪后在此注入 Deps.Users，具体路由由 router 包注册。
 
 	// 初始化认证适配器：ZITADEL 是当前唯一的认证实现，
 	// 对外只以 ports.Authenticator 端口注入。
@@ -80,7 +81,8 @@ func Build() (*Bootstrap, error) {
 		return nil, fmt.Errorf("initialize zitadel authenticator: %w", err)
 	}
 
-	// 创建 Gin Router：契约由 router 包声明，这里只负责填充。
+	// 创建 Gin Router：契约由 router 包声明，这里只负责填充依赖。
+	// 路由表由 router 包自己维护，装配层不参与注册。
 	router := ginrouter.NewRouter(ginrouter.Deps{
 		Readiness: readiness,
 		Auth:      auth,

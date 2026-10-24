@@ -45,6 +45,16 @@ func (f *fakeAuthenticator) Principal(r *http.Request) (ports.Principal, error) 
 	return f.principal, nil
 }
 
+// emptyPrincipalAuthenticator 模拟"实现返回 (零值, nil)"的情况：
+// 端口契约并未禁止这种返回，中间件必须自己兜底。
+type emptyPrincipalAuthenticator struct {
+	fakeAuthenticator
+}
+
+func (e *emptyPrincipalAuthenticator) Principal(r *http.Request) (ports.Principal, error) {
+	return ports.Principal{}, nil
+}
+
 // newTestRouter 构造一个只挂目标中间件的最小路由。
 func newTestRouter(mw gin.HandlerFunc, reached *bool, got *ports.Principal, found *bool) *gin.Engine {
 	gin.SetMode(gin.TestMode)
@@ -118,6 +128,28 @@ func TestRequireAuth_身份查询出错按未登录处理(t *testing.T) {
 	}
 	if !fake.authenticated {
 		t.Fatal("身份查询失败时应当触发认证跳转")
+	}
+}
+
+// TestRequireAuth_身份为空按未登录处理
+//
+// 端口契约允许实现返回 (零值, nil)，
+// 中间件不能只依赖 err 判断登录态，否则会把"已认证但身份为空"误判为放行。
+func TestRequireAuth_身份为空按未登录处理(t *testing.T) {
+	fake := &emptyPrincipalAuthenticator{}
+	var reached bool
+	var got ports.Principal
+	var found bool
+	r := newTestRouter(RequireAuth(fake), &reached, &got, &found)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/users", nil))
+
+	if reached {
+		t.Fatal("身份为空时必须中断请求")
+	}
+	if !fake.authenticated {
+		t.Fatal("身份为空时应当触发认证跳转")
 	}
 }
 
