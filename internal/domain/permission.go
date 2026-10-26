@@ -2,6 +2,7 @@
 package domain
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -54,4 +55,14 @@ func ParseCode(code string) (resource, action string, err error) {
 		return "", "", ErrInvalidCode
 	}
 	return resource, action, nil
+}
+
+// ValidateCodes 校验一组权限代码是否全部合法，返回首个非法代码。
+func ValidateCodes(codes []string) error {
+	for _, code := range codes {
+		if _, _, err := ParseCode(code); err != nil {
+			return fmt.Errorf("权限代码 %q 非法：%w", code, ErrInvalidCode)
+		}
+	}
+	return nil
 }
