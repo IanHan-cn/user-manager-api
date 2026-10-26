@@ -24,6 +24,7 @@ import (
 
 	// 注册 PostgreSQL 数据库驱动，缺失会报 "database driver unknown"。
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
 	"github.com/memories-cn/user-management-api/internal/config"
@@ -127,6 +128,50 @@ func run(opts options) error {
 	return dispatch(m, opts)
 }
 
+// migrateLogger 把 golang-migrate 的内部日志桥接到 slog。
+//
+// Migrate.Log 默认为 nil，迁移过程中的每个文件都不会留下痕迹；
+// 赋值后每执行完一个迁移文件会回调一次 Printf，参数为
+// “<版本>/<方向> <文件名> (<耗时>)”，例如 "3/u 000003_create_roles (12ms)"。
+type migrateLogger struct {
+	// applied 是本轮已执行的文件数，用于体现“跑到了第几个文件”。
+	applied int
+	// total 是迁移源中的文件总数，用于给出进度参照。
+	total int
+}
+
+// Printf 实现 migrate.Logger，每个迁移文件执行完成时回调一次。
+func (l *migrateLogger) Printf(format string, v ...interface{}) {
+	l.applied++
+	slog.Info("迁移文件执行完成",
+		"本轮第", l.applied,
+		"源文件总数", l.total,
+		"文件", strings.TrimSpace(fmt.Sprintf(format, v...)),
+	)
+}
+
+// Verbose 返回 false：关掉调度、缓冲等冗余信息，
+// 单个文件的完成记录不受该开关影响，仍会正常输出。
+func (*migrateLogger) Verbose() bool { return false }
+
+// countMigrations 遍历迁移源统计版本数量，用于日志里的进度参照。
+// 遍历结束（无论是否为 fs.ErrNotExist）都返回已统计到的数量，失败时返回 0。
+func countMigrations(src source.Driver) int {
+	version, err := src.First()
+	if err != nil {
+		return 0
+	}
+
+	count := 1
+	for {
+		version, err = src.Next(version)
+		if err != nil {
+			return count
+		}
+		count++
+	}
+}
+
 // newMigrator 基于内嵌迁移文件与给定 DSN 构建迁移实例，
 // 返回的 close 函数负责释放迁移源与数据库连接。
 func newMigrator(dsn string) (*migrate.Migrate, func(), error) {
@@ -139,6 +184,7 @@ func newMigrator(dsn string) (*migrate.Migrate, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("初始化迁移实例失败：%w", err)
 	}
+	m.Log = &migrateLogger{total: countMigrations(src)}
 
 	return m, func() {
 		if srcErr, dbErr := m.Close(); srcErr != nil || dbErr != nil {
@@ -196,13 +242,13 @@ func applyUp(m *migrate.Migrate, steps int) error {
 	err := move(m, steps, true)
 	switch {
 	case errors.Is(err, migrate.ErrNoChange):
-		slog.Info("数据库已是最新版本，没有待执行的迁移")
+		slog.Info("数据库已是最新版本，没有待执行的迁移", "当前版本", mustVersion(m))
 		return nil
 	case err != nil:
 		return fmt.Errorf("应用迁移失败：%w", err)
 	}
 
-	slog.Info("迁移应用成功", "步数", steps)
+	slog.Info("迁移应用成功", "步数", steps, "当前版本", mustVersion(m))
 	return nil
 }
 
@@ -211,14 +257,28 @@ func applyDown(m *migrate.Migrate, steps int) error {
 	err := move(m, steps, false)
 	switch {
 	case errors.Is(err, migrate.ErrNoChange):
-		slog.Info("数据库没有可回滚的迁移")
+		slog.Info("数据库没有可回滚的迁移", "当前版本", mustVersion(m))
 		return nil
 	case err != nil:
 		return fmt.Errorf("回滚迁移失败：%w", err)
 	}
 
-	slog.Info("迁移回滚成功", "步数", steps)
+	slog.Info("迁移回滚成功", "步数", steps, "当前版本", mustVersion(m))
 	return nil
+}
+
+// mustVersion 读取当前迁移版本用于日志展示，读取失败时退化为 -1，
+// 避免因为补充日志信息而中断一次已经执行成功的迁移。
+func mustVersion(m *migrate.Migrate) int {
+	version, _, err := m.Version()
+	switch {
+	case errors.Is(err, migrate.ErrNilVersion):
+		return 0
+	case err != nil:
+		slog.Warn("读取迁移版本失败", "error", err)
+		return -1
+	}
+	return int(version)
 }
 
 // move 按方向推进迁移，forward 为 true 表示向前应用、false 表示回滚；
