@@ -1,11 +1,17 @@
-// 权限由系统维护，不允许租户管理员任意创建新的可执行权限代码。租户管理员可以在已有权限集合内组合自定义角色。
-package domain
+// Package permission 定义系统权限目录实体与权限代码的解析规则。
+//
+// 分层约束：本包属于 Domain，不得依赖 Gin、GORM、Redis 或 Casbin。
+// 权限由系统维护，不允许租户管理员任意创建新的可执行权限代码。
+// 租户管理员可以在已有权限集合内组合自定义角色。
+package permission
 
 import (
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/memories-cn/user-management-api/internal/domain"
 )
 
 const (
@@ -13,6 +19,9 @@ const (
 	maxActionLen   = 64
 	maxCodeLen     = 128
 )
+
+// ErrInvalidCode 表示权限代码格式不合法。
+var ErrInvalidCode = fmt.Errorf("%w: 权限对外标识", domain.ErrInvalidKey)
 
 // 标识格式约束：只允许小写字母、数字与下划线，且以小写字母开头。
 //

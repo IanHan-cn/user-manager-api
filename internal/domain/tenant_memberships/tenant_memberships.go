@@ -12,9 +12,9 @@ const (
 )
 
 type TenantMemberships struct {
-	ID          string                  //	成员关系主键
-	TenantID    string                  //	所属租户
-	UserID      string                  //	对应的用户
+	ID          string                  //	成员关系主键 UUIDv7
+	TenantID    string                  //	所属租户  UUIDv7
+	UserID      string                  //	对应的用户  UUIDv7
 	Status      TenantMembershipsStatus //	成员关系状态
 	Invited_by  string                  //	邀请人的用户 ID
 	InvitedAt   time.Time               //	邀请时间

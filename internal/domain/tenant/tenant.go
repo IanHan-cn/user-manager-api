@@ -94,6 +94,13 @@ func WithSettings(settings map[string]any) Option {
 }
 
 // NewTenant 由指定用户创建租户，createdBy 为创建者用户标识，不能为空。
+//
+// t, err := tenant.NewTenant("acme", "Acme", userID,
+//
+//	tenant.WithPlanCode("pro"),
+//	tenant.WithSettings(map[string]any{"timezone": "Asia/Shanghai"}),
+//
+// )
 func NewTenant(slug, name, createdBy string, opts ...Option) (*Tenant, error) {
 	createdBy = strings.TrimSpace(createdBy)
 	if createdBy == "" {
@@ -103,6 +110,8 @@ func NewTenant(slug, name, createdBy string, opts ...Option) (*Tenant, error) {
 }
 
 // NewSystemTenant 在系统初始化场景下创建租户，创建者固定为 SystemCreator。
+//
+// t, err := tenant.NewSystemTenant("default", "Default")
 func NewSystemTenant(slug, name string, opts ...Option) (*Tenant, error) {
 	return newTenant(slug, name, SystemCreator, opts...)
 }

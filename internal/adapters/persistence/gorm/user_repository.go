@@ -5,8 +5,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/memories-cn/user-management-api/internal/domain"
-	"github.com/memories-cn/user-management-api/internal/ports"
+	domainuser "github.com/memories-cn/user-management-api/internal/domain/user"
 	"gorm.io/gorm"
 )
 
@@ -26,10 +25,10 @@ func NewUserRepository(
 	return &UserRepository{db: db}, nil
 }
 
-var _ ports.UserRepository = (*UserRepository)(nil)
+var _ domainuser.Repository = (*UserRepository)(nil)
 
-func (r *UserRepository) FindByID(ctx context.Context, id string) (*domain.User, error) {
-	var user domain.User
+func (r *UserRepository) FindByID(ctx context.Context, id string) (*domainuser.User, error) {
+	var user domainuser.User
 	db := dBFromContext(ctx, r.db)
 	if err := db.WithContext(ctx).Where("id = ?", id).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {

@@ -1,10 +1,18 @@
-package domain
+// Package role 定义租户角色实体、角色标识约束与构造规则。
+//
+// 分层约束：本包属于 Domain，不得依赖 Gin、GORM、Redis 或 Casbin。
+// 角色标识是租户内的受控词表：系统预置角色不可被自定义角色占用。
+package role
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
 	"uuid"
+
+	"github.com/memories-cn/user-management-api/internal/domain"
 )
 
 // 系统预置角色标识。
@@ -19,6 +27,17 @@ var (
 var SystemKeys = map[string]struct{}{
 	KeyOwner: {}, KeyAdmin: {}, KeyMember: {}, KeyViewer: {},
 }
+
+var (
+	// ErrReservedSystemKey 表示自定义角色使用了系统预置角色的标识。
+	ErrReservedSystemKey = errors.New("该标识属于系统预置角色，不可用于自定义角色")
+
+	// ErrInvalidRoleKey 表示角色标识格式不合法。
+	ErrInvalidRoleKey = fmt.Errorf("%w: 角色标识格式", domain.ErrInvalidKey)
+
+	// ErrInvalidTenantID 表示租户标识不能为空。
+	ErrInvalidTenantID = errors.New("租户标识不能为空")
+)
 
 type Role struct {
 	ID          string // 主键
@@ -82,7 +101,7 @@ func newRole(tenantID uuid.UUID, key, name, description string, isSystem bool) (
 
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > maxNameLen {
-		return nil, ErrInvalidName
+		return nil, domain.ErrInvalidName
 	}
 
 	now := time.Now()

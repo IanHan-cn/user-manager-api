@@ -1,6 +1,6 @@
--- 权限表，对应 domain.Permission。
+-- 权限表，对应 domain/permission.Permission。
 -- 权限由系统维护、全租户共享，因此不含 tenant_id；
--- 列长度与 domain 包中的约束保持一致：resource/action 最长 64、code 最长 128。
+-- 列长度与 domain/permission 包中的约束保持一致：resource/action 最长 64、code 最长 128。
 CREATE TABLE IF NOT EXISTS permissions (
     id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     code        VARCHAR(128) NOT NULL,
@@ -10,10 +10,10 @@ CREATE TABLE IF NOT EXISTS permissions (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
 
     -- 资源与操作标识只含小写字母、数字与下划线，且以小写字母开头，
-    -- 与 domain.identPattern 保持一致。
+    -- 与 domain/permission.identPattern 保持一致。
     CONSTRAINT chk_permissions_resource_format CHECK (resource ~ '^[a-z][a-z0-9_]*$'),
     CONSTRAINT chk_permissions_action_format CHECK (action ~ '^[a-z][a-z0-9_]*$'),
-    -- code 由 resource 与 action 以 ':' 连接而成，与 domain.BuildCode 保持一致，
+    -- code 由 resource 与 action 以 ':' 连接而成，与 domain/permission.BuildCode 保持一致，
     -- 防止绕过应用层写入与 resource/action 不自洽的 code。
     CONSTRAINT chk_permissions_code_format CHECK (code ~ '^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$'),
     CONSTRAINT chk_permissions_code_consistent CHECK (code = resource || ':' || action)

@@ -4,17 +4,18 @@ package user
 import (
 	"errors"
 
+	domainuser "github.com/memories-cn/user-management-api/internal/domain/user"
 	"github.com/memories-cn/user-management-api/internal/ports"
 )
 
 var ErrMissingRepository = errors.New("user repository is required")
 
 type Service struct {
-	repo ports.UserRepository
+	repo domainuser.Repository
 	tx   ports.Transactor
 }
 
-func NewService(repo ports.UserRepository, tx ports.Transactor) (*Service, error) {
+func NewService(repo domainuser.Repository, tx ports.Transactor) (*Service, error) {
 	if repo == nil {
 		return nil, ErrMissingRepository
 	}

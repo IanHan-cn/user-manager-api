@@ -1,5 +1,5 @@
--- 角色表，对应 domain.Role。
--- 列长度与 domain 包中的约束保持一致：key 最长 64、name 最长 255。
+-- 角色表，对应 domain/role.Role。
+-- 列长度与 domain/role 包中的约束保持一致：key 最长 64、name 最长 255。
 CREATE TABLE IF NOT EXISTS roles (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id   UUID        NOT NULL,
@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS roles (
     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
 
     -- 角色标识只含小写字母、数字与下划线，且以小写字母开头，
-    -- 与 domain.keyPattern 保持一致，防止绕过应用层写入脏数据。
+    -- 与 domain/role.keyPattern 保持一致，防止绕过应用层写入脏数据。
     CONSTRAINT chk_roles_key_format CHECK (key ~ '^[a-z][a-z0-9_]*$')
 );
 

@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"uuid"
 
-	"github.com/memories-cn/user-management-api/internal/domain"
+	"github.com/memories-cn/user-management-api/internal/domain/permission"
+	"github.com/memories-cn/user-management-api/internal/domain/role"
 	"github.com/memories-cn/user-management-api/internal/ports"
 )
 
@@ -24,7 +25,7 @@ type systemRolePreset struct {
 // 但不能新建可执行权限。矩阵可在 Milestone 5 按产品反馈调整。
 var systemRolePresets = []systemRolePreset{
 	{
-		key:         domain.KeyOwner,
+		key:         role.KeyOwner,
 		name:        "所有者",
 		description: "租户所有者，可管理租户及成员",
 		permissions: []string{
@@ -36,7 +37,7 @@ var systemRolePresets = []systemRolePreset{
 		},
 	},
 	{
-		key:         domain.KeyAdmin,
+		key:         role.KeyAdmin,
 		name:        "管理员",
 		description: "租户管理员，可管理大部分租户资源",
 		permissions: []string{
@@ -48,13 +49,13 @@ var systemRolePresets = []systemRolePreset{
 		},
 	},
 	{
-		key:         domain.KeyMember,
+		key:         role.KeyMember,
 		name:        "成员",
 		description: "普通成员，可执行日常操作",
 		permissions: []string{"tenant:read", "member:read", "role:read", "permission:read"},
 	},
 	{
-		key:         domain.KeyViewer,
+		key:         role.KeyViewer,
 		name:        "只读",
 		description: "只读用户，仅可查看资源",
 		permissions: []string{"tenant:read", "member:read", "role:read", "permission:read"},
@@ -62,12 +63,12 @@ var systemRolePresets = []systemRolePreset{
 }
 
 type platformsetup struct {
-	roleRepo       ports.RoleRepository
-	permissionRepo ports.PermissionRepository
+	roleRepo       role.Repository
+	permissionRepo permission.Repository
 	policiesRepo   ports.PolicyRepository
 }
 
-func NewPlatformSetup(roleRepo ports.RoleRepository, permissionRepo ports.PermissionRepository, policiesRepo ports.PolicyRepository) *platformsetup {
+func NewPlatformSetup(roleRepo role.Repository, permissionRepo permission.Repository, policiesRepo ports.PolicyRepository) *platformsetup {
 	return &platformsetup{
 		roleRepo:       roleRepo,
 		permissionRepo: permissionRepo,
@@ -98,7 +99,7 @@ func (s *platformsetup) EnsureSystemRoles(ctx context.Context, tenantID uuid.UUI
 			continue
 		}
 
-		rl, err := domain.NewSystemRole(tenantID, preset.key, preset.name, preset.description)
+		rl, err := role.NewSystemRole(tenantID, preset.key, preset.name, preset.description)
 		if err != nil {
 			return fmt.Errorf("构造预置角色 %s 失败：%w", preset.key, err)
 		}
@@ -118,8 +119,8 @@ func (s *platformsetup) EnsureSystemRoles(ctx context.Context, tenantID uuid.UUI
 }
 
 // lookupPermissions 依据权限代码查询目录项，任一缺失即返回错误。
-func (s *platformsetup) lookupPermissions(ctx context.Context, codes []string) ([]*domain.Permission, error) {
-	if err := domain.ValidateCodes(codes); err != nil {
+func (s *platformsetup) lookupPermissions(ctx context.Context, codes []string) ([]*permission.Permission, error) {
+	if err := permission.ValidateCodes(codes); err != nil {
 		return nil, err
 	}
 
@@ -139,11 +140,11 @@ func normalizeCodes(codes []string) []string {
 	seen := make(map[string]struct{}, len(codes))
 	result := make([]string, 0, len(codes))
 	for _, code := range codes {
-		resource, action, err := domain.ParseCode(code)
+		resource, action, err := permission.ParseCode(code)
 		if err != nil {
 			continue
 		}
-		normalized := domain.BuildCode(resource, action)
+		normalized := permission.BuildCode(resource, action)
 		if _, dup := seen[normalized]; dup {
 			continue
 		}
@@ -154,7 +155,7 @@ func normalizeCodes(codes []string) []string {
 }
 
 // applyPermissions 写入角色权限关联与策略投影，供事务内复用。
-func (s *platformsetup) applyPermissions(ctx context.Context, tenantID, roleID string, perms []*domain.Permission) error {
+func (s *platformsetup) applyPermissions(ctx context.Context, tenantID, roleID string, perms []*permission.Permission) error {
 	ids := make([]string, 0, len(perms))
 	policyPerms := make([]ports.PolicyPermission, 0, len(perms))
 	for _, p := range perms {
