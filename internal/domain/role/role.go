@@ -5,7 +5,6 @@
 package role
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -28,15 +27,22 @@ var SystemKeys = map[string]struct{}{
 	KeyOwner: {}, KeyAdmin: {}, KeyMember: {}, KeyViewer: {},
 }
 
+// 租户标识错误不定义在本包：它是跨聚合共用的概念，
+// 统一引用 domain.ErrInvalidTenantID。
 var (
 	// ErrReservedSystemKey 表示自定义角色使用了系统预置角色的标识。
-	ErrReservedSystemKey = errors.New("该标识属于系统预置角色，不可用于自定义角色")
+	ErrReservedSystemKey = fmt.Errorf("%w: 该标识属于系统预置角色，不可用于自定义角色", domain.ErrInvalidKey)
 
 	// ErrInvalidRoleKey 表示角色标识格式不合法。
 	ErrInvalidRoleKey = fmt.Errorf("%w: 角色标识格式", domain.ErrInvalidKey)
 
-	// ErrInvalidTenantID 表示租户标识不能为空。
-	ErrInvalidTenantID = errors.New("租户标识不能为空")
+	// ErrNotSystemKey 表示构造系统角色时传入的标识不在系统预置集合内。
+	// 与 ErrReservedSystemKey 方向相反：后者是自定义角色占用了系统标识，
+	// 本错误是系统角色构造函数收到了非系统标识。
+	// 这类入参的格式往往完全合法，只是取值不在受控词表内，
+	// 因此不复用 ErrInvalidRoleKey——它的文案写着"格式"，
+	// 拿来表达"不是系统标识"会误导排障方向。
+	ErrNotSystemKey = fmt.Errorf("%w: 该标识不是系统预置角色标识", domain.ErrInvalidKey)
 )
 
 type Role struct {
@@ -52,9 +58,10 @@ type Role struct {
 }
 
 // 角色标识与名称的长度约束。
+// 名称上限与其它聚合共用同一个口径，引用 domain.MaxNameLen 而不是再写一份字面量。
 const (
 	maxKeyLen  = 64
-	maxNameLen = 255
+	maxNameLen = domain.MaxNameLen
 )
 
 // keyPattern 限定角色标识只含小写字母、数字与下划线，且以小写字母开头。
@@ -81,9 +88,10 @@ func NewCustomRole(tenantID uuid.UUID, key, name, description string) (*Role, er
 }
 
 // NewSystemRole 构造系统预置角色，key 必须命中系统预置角色集合，is_system 恒为 true。
+// key 不在集合内时返回 ErrNotSystemKey，而不是 ErrInvalidRoleKey。
 func NewSystemRole(tenantID uuid.UUID, key, name, description string) (*Role, error) {
 	if !IsSystemKey(key) {
-		return nil, ErrInvalidRoleKey
+		return nil, ErrNotSystemKey
 	}
 	return newRole(tenantID, key, name, description, true)
 }
@@ -91,7 +99,7 @@ func NewSystemRole(tenantID uuid.UUID, key, name, description string) (*Role, er
 // newRole 构造角色，key 不得为空，长度不得超过 maxKeyLen，且必须满足 keyPattern。
 func newRole(tenantID uuid.UUID, key, name, description string, isSystem bool) (*Role, error) {
 	if tenantID == uuid.Nil() {
-		return nil, ErrInvalidTenantID
+		return nil, domain.ErrInvalidTenantID
 	}
 
 	key = NormalizeKey(key)

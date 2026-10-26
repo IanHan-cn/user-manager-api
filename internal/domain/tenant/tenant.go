@@ -1,7 +1,6 @@
 package tenant
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -20,7 +19,7 @@ const (
 
 type Tenant struct {
 	ID        string         // 租户主键
-	Slug      string         // 租户唯一标识，用于 URL、外部引用等
+	Slug      string         // 租户唯一标识，用于 URL、外部引用等；软删除后不再占用，可被复用
 	Name      string         // 租户展示名称
 	Status    TenantStatus   // 租户状态
 	PlanCode  string         // 套餐标识，未来需要订阅管理时使用
@@ -33,13 +32,11 @@ type Tenant struct {
 
 const (
 	maxSlugLen = 64
-	maxNameLen = 255
+	// maxNameLen 与其它聚合共用同一个口径，引用 domain.MaxNameLen。
+	maxNameLen = domain.MaxNameLen
 	// maxPlanCodeLen 限定套餐标识长度。
 	maxPlanCodeLen = 64
 )
-
-// SystemCreator 是系统初始化（种子数据、迁移脚本）创建租户时使用的创建者标识。
-const SystemCreator = "system"
 
 var (
 	keyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -47,13 +44,9 @@ var (
 	planCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 )
 
-var (
-	// ErrInvalidPlanCode 表示套餐标识格式不合法。
-	ErrInvalidPlanCode = fmt.Errorf("%w: 套餐标识", domain.ErrInvalidKey)
-
-	// ErrInvalidCreatedBy 表示创建租户的用户标识不能为空。
-	ErrInvalidCreatedBy = fmt.Errorf("%w: 创建者不能为空", domain.ErrInvalidKey)
-)
+// 套餐标识与创建者的错误不定义在本包：二者都是跨聚合共用的领域词汇，
+// 统一引用 domain.ErrInvalidPlanCode 与 domain.ErrInvalidActor。
+// 本包只保留必须以基类包装、且只属于租户受控词表的错误。
 
 func NormalizeKey(key string) string {
 	return strings.ToLower(strings.TrimSpace(key))
@@ -70,7 +63,7 @@ func WithPlanCode(code string) Option {
 			return nil
 		}
 		if len(code) > maxPlanCodeLen || !planCodePattern.MatchString(code) {
-			return ErrInvalidPlanCode
+			return domain.ErrInvalidPlanCode
 		}
 		t.PlanCode = code
 		return nil
@@ -104,16 +97,16 @@ func WithSettings(settings map[string]any) Option {
 func NewTenant(slug, name, createdBy string, opts ...Option) (*Tenant, error) {
 	createdBy = strings.TrimSpace(createdBy)
 	if createdBy == "" {
-		return nil, ErrInvalidCreatedBy
+		return nil, domain.ErrInvalidActor
 	}
 	return newTenant(slug, name, createdBy, opts...)
 }
 
-// NewSystemTenant 在系统初始化场景下创建租户，创建者固定为 SystemCreator。
+// NewSystemTenant 在系统初始化场景下创建租户，创建者固定为 domain.SystemCreator。
 //
 // t, err := tenant.NewSystemTenant("default", "Default")
 func NewSystemTenant(slug, name string, opts ...Option) (*Tenant, error) {
-	return newTenant(slug, name, SystemCreator, opts...)
+	return newTenant(slug, name, domain.SystemCreator, opts...)
 }
 
 // newTenant 校验必填字段并填充默认值，再依次应用可选字段。
