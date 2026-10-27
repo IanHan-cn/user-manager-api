@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -47,6 +48,38 @@ var (
 // 套餐标识与创建者的错误不定义在本包：二者都是跨聚合共用的领域词汇，
 // 统一引用 domain.ErrInvalidPlanCode 与 domain.ErrInvalidActor。
 // 本包只保留必须以基类包装、且只属于租户受控词表的错误。
+
+// 写操作的结局错误：与 user / role / membership 三个包的口径一致，
+// 由适配层按 Repository 端口的约定返回，
+// 调用方既能按本聚合精确判定，也能按基类统一归类。
+var (
+	// ErrTenantExists 表示 slug 已被未删除的租户占用。
+	// Create 撞上 idx_tenants_slug_active 时必须返回它，
+	// 不得静默吞掉后返回 nil——那会让上层误以为租户已经建好。
+	ErrTenantExists = fmt.Errorf("%w: 租户", domain.ErrAlreadyExists)
+
+	// ErrTenantNotFound 表示要改动的租户不存在。
+	// Update 写入不存在的行时返回它；查询类方法未命中返回 (nil, nil)，不使用本错误。
+	ErrTenantNotFound = fmt.Errorf("%w: 租户", domain.ErrNotFound)
+
+	// ErrNilTenant 表示在空租户上执行了写操作。
+	// 以 domain.ErrNilEntity 而不是 ErrTenantNotFound 为基类：
+	// 空实体是调用方 bug（该查没查到、查到却没判空），不是"目标不存在"，
+	// 归到 NotFound 会让上层按 404 返回，把一次程序缺陷伪装成正常的业务结果。
+	ErrNilTenant = fmt.Errorf("%w: 租户", domain.ErrNilEntity)
+
+	// ErrInvalidTenantRecord 表示写入的值被数据库的 CHECK 约束拒绝。
+	//
+	// 它是兜底而不是主防线：正常路径上四条 CHECK 在领域层都有对应校验
+	// （slug 格式、状态取值、套餐格式、settings 必须是 JSON 对象），
+	// 走到这里说明两侧口径已经漂移，或调用方绕过 NewTenant 直接改了字段。
+	//
+	// 归入 domain.ErrInvalidKey：被约束拒绝的仍是"值不合法"，
+	// 上层按参数类错误返回 4xx 即可。其中 chk_tenants_deleted_consistency
+	// （status 与 deleted_at 必须同步）也走这一条——
+	// 它拒绝的是"这一组取值不成立"，而不是"当前状态不允许该操作"。
+	ErrInvalidTenantRecord = fmt.Errorf("%w: 租户记录", domain.ErrInvalidKey)
+)
 
 func NormalizeKey(key string) string {
 	return strings.ToLower(strings.TrimSpace(key))

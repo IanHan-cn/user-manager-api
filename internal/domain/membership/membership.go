@@ -75,13 +75,28 @@ type Membership struct {
 // 状态机拒绝的是"当下不能做这个操作"，入参本身并没有问题。
 var ErrInvalidStatusTransition = fmt.Errorf("%w: 成员关系状态转换", domain.ErrInvalidState)
 
-// ErrNilMembership 表示在一个空成员关系上调用了状态转换方法。
+// ErrNilMembership 表示在一个空成员关系上执行了操作。
+//
+// 既覆盖本包的状态转换方法，也覆盖适配层的写操作
+// （Create / Update 收到 nil 实体）：两种情形是同一个缺陷
+// ——该查没查到、或查到却没判空。
 //
 // 以 domain.ErrNilEntity 而不是 ErrInvalidStatusTransition 为基类：
-// 空实体是调用方 bug（该查没查到、查到却没判空），不是"状态不允许"。
+// 空实体是调用方 bug，不是"状态不允许"。
 // 归到状态类会让上层按 ErrInvalidState 返回 409，
 // 把一次程序缺陷伪装成正常的业务冲突。
 var ErrNilMembership = fmt.Errorf("%w: 成员关系", domain.ErrNilEntity)
+
+// ErrInvalidMembershipRecord 表示写入的值被数据库的 CHECK 约束拒绝。
+//
+// 它是兜底而不是主防线：正常路径上两条 CHECK 在领域层都有对应校验
+// （状态转换由四个方法守护、邀请人由构造函数校验），
+// 走到这里说明两侧口径已经漂移，或调用方绕过构造函数直接改了字段。
+//
+// 归入 domain.ErrInvalidState 而不是 ErrInvalidKey：被拒绝的是
+// chk_memberships_status_timestamps，即"状态与业务时间戳不自洽"，
+// 是当下这批取值组合不成立，而不是某一个字段格式不合法。
+var ErrInvalidMembershipRecord = fmt.Errorf("%w: 成员关系记录", domain.ErrInvalidState)
 
 // 写操作的结局错误：二者都以 domain 的基类包装，
 // 由适配层按 Repository 端口的约定返回，
