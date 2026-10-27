@@ -2,7 +2,6 @@ package gorm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -141,24 +140,21 @@ func normalizeLookupID(value string, invalid error) (normalized string, empty bo
 	return normalized, false, nil
 }
 
-// translateRoleWriteError 把数据库错误翻译成领域错误，不把驱动原生错误抛给上层。
-//
-// 只认 TranslateError 已经翻成 GORM 语义错误的那两类（见 bootstrap.OpenDB）：
-//   - ErrDuplicatedKey（23505）：撞上唯一约束，归入 ErrRoleExists；
-//   - ErrCheckConstraintViolated（23514）：值被 CHECK 约束拒绝，归入领域参数类错误。
-//
-// 单独成函数是为了让这两条判定能脱离数据库被测试：
-// 它们只看错误类型，不需要真的连一次库。
-func translateRoleWriteError(err error, role *domainrole.Role) error {
-	switch {
-	case errors.Is(err, gorm.ErrDuplicatedKey):
-		return fmt.Errorf("%w: tenant_id=%s key=%s: %w",
-			domainrole.ErrRoleExists, role.TenantID, role.Key, err)
-	case errors.Is(err, gorm.ErrCheckConstraintViolated):
-		return fmt.Errorf("%w: key=%s: %w", domainrole.ErrInvalidRoleKey, role.Key, err)
-	default:
-		return err
+// roleWriteTargets 组装角色写操作的结局配置。
+func roleWriteTargets(role *domainrole.Role) writeTargets {
+	return writeTargets{
+		conflict:         domainrole.ErrRoleExists,
+		conflictIdentity: fmt.Sprintf("tenant_id=%s key=%s", role.TenantID, role.Key),
+		invalid:          domainrole.ErrInvalidRoleKey,
+		invalidIdentity:  fmt.Sprintf("key=%s", role.Key),
 	}
+}
+
+// translateRoleWriteError 把数据库错误翻译成领域错误，两条判定见 classifyWriteError。
+//
+// 留这个薄壳是为了让调用处的意图自带聚合语义，不必知道 writeTargets 要怎么拼。
+func translateRoleWriteError(err error, role *domainrole.Role) error {
+	return classifyWriteError(err, roleWriteTargets(role))
 }
 
 // Create 写入角色，撞上 (tenant_id, key) 唯一约束时返回 ErrRoleExists。
@@ -246,21 +242,12 @@ func (r *RoleRepository) findOne(ctx context.Context, cond string, args ...strin
 	db := dBFromContext(ctx, r.db)
 	err := db.WithContext(ctx).Where(cond, toAnys(args)...).Take(&rec).Error
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if isRecordNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
 	return rec.toEntity(), nil
-}
-
-// toAnys 把字符串参数转成 GORM 占位符所需的 []any。
-func toAnys(args []string) []any {
-	out := make([]any, len(args))
-	for i, a := range args {
-		out[i] = a
-	}
-	return out
 }
 
 // ListPermissionIDs 取回角色当前的权限标识集合。
@@ -566,7 +553,7 @@ func roleExistsInTenant(ctx context.Context, db *gorm.DB, tenantID, roleID strin
 		Where("id = ? AND tenant_id = ?", roleID, tenantID).
 		Take(&id).Error
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if isRecordNotFound(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("校验角色归属失败：%w", err)
