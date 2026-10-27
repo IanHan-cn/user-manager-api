@@ -68,6 +68,36 @@ func Test租户写操作遇到空实体返回ErrNilTenant(t *testing.T) {
 	}
 }
 
+// Test租户Update遇到空主键返回记录不存在
+//
+// 与 GetByID 同一个道理：id 列是 UUID，把空串绑上去只会换来一次
+// "invalid input syntax for type uuid"。而按端口口径，空主键就是
+// "要改的行不存在"——放任它进 SQL，上层拿到的就是一个不可归类的原生错误。
+// 句柄为 nil：这段判定必须发生在任何数据库访问之前。
+func Test租户Update遇到空主键返回记录不存在(t *testing.T) {
+	ctx := context.Background()
+
+	cases := map[string]string{
+		"空串":  "",
+		"纯空白": "   ",
+	}
+
+	for name, id := range cases {
+		t.Run(name, func(t *testing.T) {
+			tn := newTestTenant(t)
+			tn.ID = id
+
+			err := (&TenantRepository{}).Update(ctx, tn)
+			if !errors.Is(err, tenant.ErrTenantNotFound) {
+				t.Fatalf("err = %v，期望 ErrTenantNotFound", err)
+			}
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("err = %v，应归类到 domain.ErrNotFound", err)
+			}
+		})
+	}
+}
+
 // Test租户查询方法遇到空入参不查库
 //
 // 句柄是 nil：只要真的发起查询就会 panic。

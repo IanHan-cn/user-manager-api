@@ -2,7 +2,6 @@ package gorm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/memories-cn/user-management-api/internal/domain/permission"
@@ -181,12 +180,4 @@ func (r *PermissionRepository) FindByCodes(ctx context.Context, codes []string) 
 	}
 
 	return orderPermissionsByCodes(normalized, indexPermissionRecords(recs))
-}
-
-// isRecordNotFound 报告错误是否为"未命中"。
-//
-// 读方法都要判它，单独成函数是为了让 gorm.ErrRecordNotFound 的引用只有一处：
-// 未命中不是错误，漏判一次就会把一次正常的空结果变成 500。
-func isRecordNotFound(err error) bool {
-	return errors.Is(err, gorm.ErrRecordNotFound)
 }

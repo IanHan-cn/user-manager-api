@@ -2,8 +2,8 @@ package gorm
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"uuid"
 
@@ -69,23 +69,6 @@ var membershipUpdatableColumns = []string{
 	"left_at",
 }
 
-// toNullableTime 把领域层的零值时间转成库里的 NULL。
-func toNullableTime(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	value := t
-	return &value
-}
-
-// fromNullableTime 把库里的 NULL 还原成领域层的零值时间。
-func fromNullableTime(t *time.Time) time.Time {
-	if t == nil {
-		return time.Time{}
-	}
-	return *t
-}
-
 // toMembershipRecord 把领域实体转成持久化模型。
 func toMembershipRecord(m *membership.Membership) membershipRecord {
 	return membershipRecord{
@@ -144,40 +127,31 @@ func membershipEntities(recs []membershipRecord) []*membership.Membership {
 	return out
 }
 
-// translateMembershipWriteError 把数据库错误翻译成领域错误，不把驱动原生错误抛给上层。
-//
-// 只认 TranslateError 已经翻成 GORM 语义错误的那两类（见 bootstrap.OpenDB）：
-//   - ErrDuplicatedKey（23505）：撞上 idx_memberships_tenant_user，归入 ErrMembershipExists；
-//   - ErrCheckConstraintViolated（23514）：状态与业务时间戳不自洽，
-//     归入 ErrInvalidMembershipRecord。
-//
-// 单独成函数是为了让这两条判定能脱离数据库被测试：它们只看错误类型，不需要真的连一次库。
-func translateMembershipWriteError(err error, m *membership.Membership) error {
-	switch {
-	case errors.Is(err, gorm.ErrDuplicatedKey):
-		return fmt.Errorf("%w: tenant_id=%s user_id=%s: %w",
-			membership.ErrMembershipExists, m.TenantID, m.UserID, err)
-	case errors.Is(err, gorm.ErrCheckConstraintViolated):
-		return fmt.Errorf("%w: id=%s status=%s: %w",
-			membership.ErrInvalidMembershipRecord, m.ID, m.Status, err)
-	default:
-		return err
+// membershipWriteTargets 组装成员关系写操作的结局配置。
+func membershipWriteTargets(m *membership.Membership) writeTargets {
+	return writeTargets{
+		conflict:         membership.ErrMembershipExists,
+		conflictIdentity: fmt.Sprintf("tenant_id=%s user_id=%s", m.TenantID, m.UserID),
+		invalid:          membership.ErrInvalidMembershipRecord,
+		invalidIdentity:  fmt.Sprintf("id=%s status=%s", m.ID, m.Status),
 	}
 }
 
+// translateMembershipWriteError 把数据库错误翻译成领域错误，两条判定见
+// classifyWriteError。留这个薄壳是为了让调用处的意图自带聚合语义，
+// 不必知道 writeTargets 要怎么拼。
+func translateMembershipWriteError(err error, m *membership.Membership) error {
+	return classifyWriteError(err, membershipWriteTargets(m))
+}
+
 // translateMembershipUpdateResult 判定 Update 的执行结果：出错翻译成领域错误，
-// 没改到任何行返回 ErrMembershipNotFound。
-//
-// 单独成函数是为了让这两条判定能脱离数据库被测试——
-// 它们只看 Error 与 RowsAffected，不需要真的连一次库。
+// 没改到任何行返回 ErrMembershipNotFound。两条判定见 classifyUpdateResult。
 func translateMembershipUpdateResult(result *gorm.DB, m *membership.Membership) error {
-	if result.Error != nil {
-		return translateMembershipWriteError(result.Error, m)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("%w: id=%s", membership.ErrMembershipNotFound, m.ID)
-	}
-	return nil
+	return classifyUpdateResult(result, updateTargets{
+		write:    membershipWriteTargets(m),
+		notFound: membership.ErrMembershipNotFound,
+		identity: fmt.Sprintf("id=%s", m.ID),
+	})
 }
 
 // Create 写入成员关系，撞上 (tenant_id, user_id) 唯一约束时返回 ErrMembershipExists。
@@ -206,6 +180,14 @@ func (r *MembershipRepository) Create(ctx context.Context, m *membership.Members
 func (r *MembershipRepository) Update(ctx context.Context, m *membership.Membership) error {
 	if m == nil {
 		return membership.ErrNilMembership
+	}
+	// 空标识先短路，理由与查询侧一致：id、tenant_id 都是 UUID 列，
+	// 空串进去只会换来一次类型错误，而按端口口径这就是"要改的行不存在"。
+	// 少了这一段，一次本该精确可判的 ErrMembershipNotFound 会变成
+	// 语义不明的驱动原生错误，最终落成 500。
+	if strings.TrimSpace(m.ID) == "" || strings.TrimSpace(m.TenantID) == "" {
+		return fmt.Errorf("%w: id=%s tenant_id=%s",
+			membership.ErrMembershipNotFound, m.ID, m.TenantID)
 	}
 
 	rec := toMembershipRecord(m)

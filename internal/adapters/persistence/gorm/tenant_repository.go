@@ -2,7 +2,6 @@ package gorm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -138,38 +137,31 @@ func (r tenantRecord) toUpdateMap() map[string]any {
 	}
 }
 
-// translateTenantWriteError 把数据库错误翻译成领域错误，不把驱动原生错误抛给上层。
-//
-// 只认 TranslateError 已经翻成 GORM 语义错误的那两类（见 bootstrap.OpenDB）：
-//   - ErrDuplicatedKey（23505）：撞上 idx_tenants_slug_active，归入 ErrTenantExists；
-//   - ErrCheckConstraintViolated（23514）：slug 格式、套餐格式、
-//     settings 不是 JSON 对象、或 status 与 deleted_at 不同步，归入 ErrInvalidTenantRecord。
-//
-// 单独成函数是为了让这两条判定能脱离数据库被测试：它们只看错误类型，不需要真的连一次库。
-func translateTenantWriteError(err error, t *tenant.Tenant) error {
-	switch {
-	case errors.Is(err, gorm.ErrDuplicatedKey):
-		return fmt.Errorf("%w: slug=%s: %w", tenant.ErrTenantExists, t.Slug, err)
-	case errors.Is(err, gorm.ErrCheckConstraintViolated):
-		return fmt.Errorf("%w: id=%s: %w", tenant.ErrInvalidTenantRecord, t.ID, err)
-	default:
-		return err
+// tenantWriteTargets 组装租户写操作的结局配置。
+func tenantWriteTargets(t *tenant.Tenant) writeTargets {
+	return writeTargets{
+		conflict:         tenant.ErrTenantExists,
+		conflictIdentity: fmt.Sprintf("slug=%s", t.Slug),
+		invalid:          tenant.ErrInvalidTenantRecord,
+		invalidIdentity:  fmt.Sprintf("id=%s", t.ID),
 	}
 }
 
+// translateTenantWriteError 把数据库错误翻译成领域错误，两条判定见
+// classifyWriteError。留这个薄壳是为了让调用处的意图自带聚合语义，
+// 不必知道 writeTargets 要怎么拼。
+func translateTenantWriteError(err error, t *tenant.Tenant) error {
+	return classifyWriteError(err, tenantWriteTargets(t))
+}
+
 // translateTenantUpdateResult 判定 Update 的执行结果：出错翻译成领域错误，
-// 没改到任何行返回 ErrTenantNotFound。
-//
-// 单独成函数是为了让这两条判定能脱离数据库被测试——
-// 它们只看 Error 与 RowsAffected，不需要真的连一次库。
+// 没改到任何行返回 ErrTenantNotFound。两条判定见 classifyUpdateResult。
 func translateTenantUpdateResult(result *gorm.DB, t *tenant.Tenant) error {
-	if result.Error != nil {
-		return translateTenantWriteError(result.Error, t)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("%w: id=%s", tenant.ErrTenantNotFound, t.ID)
-	}
-	return nil
+	return classifyUpdateResult(result, updateTargets{
+		write:    tenantWriteTargets(t),
+		notFound: tenant.ErrTenantNotFound,
+		identity: fmt.Sprintf("id=%s", t.ID),
+	})
 }
 
 // Create 写入租户，撞上 slug 唯一约束时返回 ErrTenantExists。
@@ -195,6 +187,12 @@ func (r *TenantRepository) Create(ctx context.Context, t *tenant.Tenant) error {
 func (r *TenantRepository) Update(ctx context.Context, t *tenant.Tenant) error {
 	if t == nil {
 		return tenant.ErrNilTenant
+	}
+	// 空主键先短路：id 列是 UUID，把空串绑上去换来的只是一次
+	// "invalid input syntax for type uuid"，而这正是端口眼里最典型的
+	// "要改的行不存在"。统一成 ErrTenantNotFound，上层才有的可判。
+	if strings.TrimSpace(t.ID) == "" {
+		return fmt.Errorf("%w: id=%s", tenant.ErrTenantNotFound, t.ID)
 	}
 
 	rec := toTenantRecord(t)

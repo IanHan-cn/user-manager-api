@@ -155,7 +155,7 @@ func (r *UserRepository) findOne(ctx context.Context, cond, arg string) (*domain
 	db := dBFromContext(ctx, r.db)
 	err := db.WithContext(ctx).Where(cond, arg).Take(&rec).Error
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if isRecordNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -199,38 +199,31 @@ func (r *UserRepository) Update(ctx context.Context, u *domainuser.User) error {
 	return translateUpdateResult(result, u)
 }
 
-// translateWriteError 把数据库错误翻译成领域错误，不把驱动原生错误抛给上层。
-//
-// 只认 TranslateError 已经翻成 GORM 语义错误的那两类（见 bootstrap.OpenDB）：
-//   - ErrDuplicatedKey（23505）：撞上唯一约束，归入 ErrUserExists；
-//   - ErrCheckConstraintViolated（23514）：值被 CHECK 约束拒绝，归入领域参数类错误。
-//
-// 文案刻意不指名冲突的是哪一列：zitadel_user_id、username、email 各有唯一索引，
-// 写死任何一个都会在撞上另一个时把排障带偏；
-// 真正被违反的约束名只有驱动知道，因此底层错误用第二个 %w 原样挂在链上。
-func translateWriteError(err error, u *domainuser.User) error {
-	switch {
-	case errors.Is(err, gorm.ErrDuplicatedKey):
-		return fmt.Errorf("%w: id=%s zitadel_user_id=%s: %w",
-			domainuser.ErrUserExists, u.ID, u.ZitadelUserID, err)
-	case errors.Is(err, gorm.ErrCheckConstraintViolated):
-		return fmt.Errorf("%w: id=%s: %w", domainuser.ErrInvalidUserRecord, u.ID, err)
-	default:
-		return err
+// userWriteTargets 组装用户写操作的结局配置。
+func userWriteTargets(u *domainuser.User) writeTargets {
+	return writeTargets{
+		conflict:         domainuser.ErrUserExists,
+		conflictIdentity: fmt.Sprintf("id=%s zitadel_user_id=%s", u.ID, u.ZitadelUserID),
+		invalid:          domainuser.ErrInvalidUserRecord,
+		invalidIdentity:  fmt.Sprintf("id=%s", u.ID),
 	}
 }
 
-// translateUpdateResult 判定 Update 的执行结果：出错翻译成领域错误，
-// 没改到任何行返回 ErrUserNotFound。
+// translateWriteError 把数据库错误翻译成领域错误，两条判定见 classifyWriteError。
 //
-// 单独成函数是为了让这两条判定能脱离数据库被测试——
-// 它们只看 Error 与 RowsAffected，不需要真的连一次库。
+// 文案刻意不指名冲突的是哪一列：zitadel_user_id、username、email 各有唯一索引，
+// 写死任何一个都会在撞上另一个时把排障带偏；
+// 真正被违反的约束名只有驱动知道，因此底层错误被挂在链上原样保留。
+func translateWriteError(err error, u *domainuser.User) error {
+	return classifyWriteError(err, userWriteTargets(u))
+}
+
+// translateUpdateResult 判定 Update 的执行结果：出错翻译成领域错误，
+// 没改到任何行返回 ErrUserNotFound。两条判定见 classifyUpdateResult。
 func translateUpdateResult(result *gorm.DB, u *domainuser.User) error {
-	if result.Error != nil {
-		return translateWriteError(result.Error, u)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("%w: id=%s", domainuser.ErrUserNotFound, u.ID)
-	}
-	return nil
+	return classifyUpdateResult(result, updateTargets{
+		write:    userWriteTargets(u),
+		notFound: domainuser.ErrUserNotFound,
+		identity: fmt.Sprintf("id=%s", u.ID),
+	})
 }

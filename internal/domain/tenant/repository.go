@@ -29,7 +29,9 @@ import (
 // 否则会命中已删除的墓碑行，返回本应已被释放的租户。
 type Repository interface {
 	// Create 创建租户。
-	// 主键与时间戳由领域层生成，实现方原样落库，不得改写；
+	// 主键与 created_at 由领域层生成，实现方原样落库，不得改写；
+	// updated_at 是唯一的例外——它由触发器写入（见类型注释的"通用约定"小节），
+	// 实现方既不要给它赋值，也不要把它放进 INSERT。
 	// 命中 slug 唯一约束时返回 ErrTenantExists，
 	// 不得静默吞掉后返回 nil——那会让上层误以为租户已经建好。
 	// 传入空实体返回 ErrNilTenant。
@@ -40,6 +42,9 @@ type Repository interface {
 	// 本方法不带软删除条件：按主键取回的行即使已删除也要返回，
 	// 否则"删除后回看这条租户"这类场景无从实现。
 	// 只想要未删除的租户时，调用方自行判定 Status 或 DeletedAt。
+	//
+	// 空标识表示"没有依据可查"，返回 (nil, nil)：把它打进 UUID 主键列
+	// 只会换来一次不知所云的类型转换错误。
 	GetByID(ctx context.Context, id string) (*Tenant, error)
 
 	// GetBySlug 按唯一标识查询租户，未命中返回 (nil, nil)。
@@ -52,12 +57,18 @@ type Repository interface {
 	// 入参在查询前须经 NormalizeKey 归一化，库里存的是归一化小写值。
 	GetBySlug(ctx context.Context, slug string) (*Tenant, error)
 
-	// Update 全量更新租户的业务字段，id 与 created_at 除外。
+	// Update 全量更新租户的业务字段。
+	//
+	// 不可写的列为 id、created_at、created_by、updated_at 四项：
+	// id 与 created_at 创建后不可变；created_by 是"谁创建的"这一历史事实，
+	// 换了它等于换了一条记录的来历，不是一次修改；updated_at 由触发器维护。
+	// 其余列（含 slug、status、deleted_at、settings、plan_code）均可写。
 	//
 	// status 与 deleted_at 必须成对写入：二者由 CHECK 约束强制同步
 	// （见类型注释的"软删除"小节），只写其一会被数据库拒绝。
-	// updated_at 由触发器维护，实现方不写。
 	//
+	// 传入空实体返回 ErrNilTenant；主键为空同样按"要改的行不存在"处理，
+	// 不得把它打进 UUID 列去换一次类型错误。
 	// 记录不存在时返回 ErrTenantNotFound：更新不存在的行属于调用方 bug，
 	// 静默成功会让上层误以为更新生效。
 	Update(ctx context.Context, t *Tenant) error

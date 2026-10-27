@@ -69,6 +69,36 @@ func Test写操作遇到空实体返回ErrNilMembership(t *testing.T) {
 	}
 }
 
+// Test成员关系Update遇到空标识返回记录不存在
+//
+// id 与 tenant_id 都是 UUID 列：空串绑上去换来的只是一次类型错误，
+// 而按端口口径这就是"要改的行不存在"。放任它进 SQL，
+// 一次本该精确可判的 ErrMembershipNotFound 会变成不可归类的原生错误。
+// 句柄为 nil：这段判定必须发生在任何数据库访问之前。
+func Test成员关系Update遇到空标识返回记录不存在(t *testing.T) {
+	ctx := context.Background()
+
+	cases := map[string]func(m *membership.Membership){
+		"主键为空":   func(m *membership.Membership) { m.ID = "" },
+		"租户标识为空": func(m *membership.Membership) { m.TenantID = "  " },
+	}
+
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newTestMembership(t)
+			mutate(m)
+
+			err := (&MembershipRepository{}).Update(ctx, m)
+			if !errors.Is(err, membership.ErrMembershipNotFound) {
+				t.Fatalf("err = %v，期望 ErrMembershipNotFound", err)
+			}
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("err = %v，应归类到 domain.ErrNotFound", err)
+			}
+		})
+	}
+}
+
 // Test查询方法遇到零值标识不查库
 //
 // 句柄是 nil：只要真的发起查询就会 panic。

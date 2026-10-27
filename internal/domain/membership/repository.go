@@ -58,7 +58,20 @@ type Repository interface {
 	// 用户离开后再次加入走"重新邀请"流程（见类型注释），不调用本方法。
 	Create(ctx context.Context, m *Membership) error
 
-	// Update 全量更新成员关系的业务字段，created_at 与 updated_at 除外。
+	// Update 全量更新成员关系的业务字段。
+	//
+	// 不可写的列为 id、tenant_id、user_id、created_at、updated_at 五项：
+	// 前三者是成员关系的业务键，换了其中任何一个就已是另一条关系而不是
+	// "改了一下"（见类型注释的"重新邀请"小节）；created_at 不可变，
+	// updated_at 归触发器维护。真正会被写入的只有 status 与
+	// invited_by、invited_at、joined_at、suspended_at、left_at。
+	//
+	// 更新必须以 tenant_id 为条件（见类型注释的"租户隔离"小节）：
+	// 传入的关系归属与库中不一致时按未命中处理，
+	// 返回 ErrMembershipNotFound 而不是去改别的租户的行。
+	//
+	// 传入空实体返回 ErrNilMembership；
+	// id 或 tenant_id 为空同样按"要改的行不存在"处理。
 	// 记录不存在时返回 ErrMembershipNotFound：全量更新写入不存在的行属于
 	// 调用方 bug，静默成功会让上层误以为更新生效。
 	Update(ctx context.Context, m *Membership) error
