@@ -39,7 +39,9 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/memories-cn/user-management-api/internal/domain/membership"
+	"github.com/memories-cn/user-management-api/internal/domain/membershiprole"
 	"github.com/memories-cn/user-management-api/internal/domain/permission"
+	"github.com/memories-cn/user-management-api/internal/domain/role"
 	"github.com/memories-cn/user-management-api/internal/domain/tenant"
 	"github.com/memories-cn/user-management-api/migrations"
 	"github.com/testcontainers/testcontainers-go"
@@ -165,7 +167,7 @@ func applyMigrations(dsn string) error {
 	return nil
 }
 
-// integrationFixture 是集成用例的运行环境：一个刚清空的库与三个仓储。
+// integrationFixture 是集成用例的运行环境：一个刚清空的库与各聚合的仓储。
 //
 // 每个用例开头清一次表：库在同一个容器里被所有用例共用，
 // 用例之间不做数据隔离会让某个用例的残留成为另一个用例的隐藏前提。
@@ -173,6 +175,8 @@ type integrationFixture struct {
 	ctx         context.Context
 	tenants     *TenantRepository
 	memberships *MembershipRepository
+	memberRoles *MembershipRoleRepository
+	roles       *RoleRepository
 	permissions *PermissionRepository
 	raw         *gorm.DB
 }
@@ -188,8 +192,10 @@ func newIntegrationFixture(t *testing.T) integrationFixture {
 	}
 
 	// 全仓各表一律无外键（见 000008 的注释），因此可以放心一次性清空；
-	// 这里只清本文件会碰到的三张表。
-	if err := integrationDB.Exec("TRUNCATE TABLE tenants, memberships, permissions").Error; err != nil {
+	// 这里只清本文件会碰到的几张表。
+	if err := integrationDB.Exec(
+		"TRUNCATE TABLE tenants, memberships, membership_roles, roles, permissions",
+	).Error; err != nil {
 		t.Fatalf("清空集成表失败：%v", err)
 	}
 
@@ -198,6 +204,8 @@ func newIntegrationFixture(t *testing.T) integrationFixture {
 	repos := []func() error{
 		func() (err error) { fixture.tenants, err = NewTenantRepository(integrationDB); return },
 		func() (err error) { fixture.memberships, err = NewMembershipRepository(integrationDB); return },
+		func() (err error) { fixture.memberRoles, err = NewMembershipRoleRepository(integrationDB); return },
+		func() (err error) { fixture.roles, err = NewRoleRepository(integrationDB); return },
 		func() (err error) { fixture.permissions, err = NewPermissionRepository(integrationDB); return },
 	}
 	for _, build := range repos {
@@ -574,5 +582,308 @@ func newFixturePermission(code string) permissionRecord {
 		Resource:  resource,
 		Action:    action,
 		CreatedAt: time.Now(),
+	}
+}
+
+// mustCreateMembership 建一条成员关系并落库，返回它的主键，失败即终止用例。
+//
+// 授权行没有外键兜底，但成员关系这一侧仍然真实建出来：
+// 集成库里的 membership_id 应当指向一条真实存在的成员关系，
+// 否则本文件的用例就与线上形态脱节了。
+func (f integrationFixture) mustCreateMembership(t *testing.T, tenantID, userID uuid.UUID) uuid.UUID {
+	t.Helper()
+
+	m, err := membership.NewSystem(tenantID, userID)
+	if err != nil {
+		t.Fatalf("构造成员关系失败：%v", err)
+	}
+	if err := f.memberships.Create(f.ctx, m); err != nil {
+		t.Fatalf("写入成员关系失败：%v", err)
+	}
+	return mustParseUUID(t, m.ID)
+}
+
+// mustCreateRole 建一个系统预置角色并落库，返回它的主键，失败即终止用例。
+func (f integrationFixture) mustCreateRole(t *testing.T, tenantID uuid.UUID, key string) uuid.UUID {
+	t.Helper()
+
+	r, err := role.NewSystemRole(tenantID, key, key+"角色", "")
+	if err != nil {
+		t.Fatalf("构造角色失败：%v", err)
+	}
+	if err := f.roles.Create(f.ctx, r); err != nil {
+		t.Fatalf("写入角色失败：%v", err)
+	}
+	return mustParseUUID(t, r.ID)
+}
+
+// mustGrantRole 以系统身份把角色授予指定成员关系并落库，失败即终止用例。
+// expiresAt 为零值表示长期有效。
+func (f integrationFixture) mustGrantRole(
+	t *testing.T, tenantID, membershipID, roleID uuid.UUID, expiresAt time.Time,
+) *membershiprole.MembershipRole {
+	t.Helper()
+
+	grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, expiresAt, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, grant); err != nil {
+		t.Fatalf("写入授权失败：%v", err)
+	}
+	return grant
+}
+
+// mustParseUUID 解析实体主键，供需要 uuid.UUID 的仓储方法使用。
+func mustParseUUID(t *testing.T, id string) uuid.UUID {
+	t.Helper()
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("解析主键 %q 失败：%v", id, err)
+	}
+	return parsed
+}
+
+// Test成员角色重复授权同一角色返回已存在且撤销后可重新分配
+//
+// 这一条同时钉住三件事，缺一件就会错：
+//   - idx_membership_roles_membership_role_active 是部分索引 ——
+//     未失效的授权撞约束必须被挡住并翻译成 ErrMembershipRoleExists；
+//   - 撤销之后的旧行不再算作"未失效" —— 同一个角色可以被重新分配；
+//   - 重新分配是新插一行而不是复活旧行 —— 历史行与其撤销原因必须原样保留。
+//
+// 三者都是 migrations/000009 写在注释里的约定，只有真库能证明它们生效。
+func Test成员角色重复授权同一角色返回已存在且撤销后可重新分配(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+
+	first := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+
+	// 未失效的授权重复插入：撞上部分唯一索引。
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, dup); !errors.Is(err, membershiprole.ErrMembershipRoleExists) {
+		t.Fatalf("err = %v，期望 ErrMembershipRoleExists", err)
+	}
+
+	// 撤销：旧行转为 revoked，从此不再占用这对取值。
+	if err := first.Revoke("误授权"); err != nil {
+		t.Fatalf("撤销失败：%v", err)
+	}
+	if err := f.memberRoles.Update(f.ctx, first); err != nil {
+		t.Fatalf("落库撤销失败：%v", err)
+	}
+	if got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID); got != nil || err != nil {
+		t.Fatalf("撤销后不应再查到未失效的授权，实际 (%+v, %v)", got, err)
+	}
+
+	// 重新分配：新插一行，成功而不是撞约束。
+	second := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+
+	// 历史行与其撤销原因必须原样保留。
+	all, err := f.memberRoles.ListByMembershipID(f.ctx, tenantID, membershipID)
+	if err != nil {
+		t.Fatalf("查询授权列表失败：%v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("应有 2 行（旧的历史行 + 新的生效行），实际 %d", len(all))
+	}
+	if all[0].Status != membershiprole.StatusRevoked || all[0].Reason != "误授权" {
+		t.Fatalf("历史行被改写：%+v", all[0])
+	}
+	if all[1].Status != membershiprole.StatusActive || all[1].ID != second.ID {
+		t.Fatalf("新行应为生效状态且排在后面：%+v", all[1])
+	}
+
+	// 当前生效的那条要能被单独取回。
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID)
+	if err != nil || got == nil || got.ID != second.ID {
+		t.Fatalf("应取回重新分配的那条，实际 (%+v, %v)", got, err)
+	}
+}
+
+// Test成员角色失效时间不晚于生效时间被数据库拒绝
+//
+// 应用层由构造函数与 Approve 守护这一条，这里是数据库侧的兜底：
+// 绕过它们直接把 expires_at 改成等于 effective_at 时，
+// chk_membership_roles_expires_after_effective 必须拒绝。
+func Test成员角色失效时间不晚于生效时间被数据库拒绝(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+
+	// 等于生效时间即"从未成立过"：数据库必须挡住。
+	grant.ExpiresAt = grant.EffectiveAt
+
+	err := f.memberRoles.Update(f.ctx, grant)
+	if !errors.Is(err, membershiprole.ErrInvalidMembershipRoleRecord) {
+		t.Fatalf("err = %v，期望被 CHECK 拒绝并归入 ErrInvalidMembershipRoleRecord", err)
+	}
+
+	got, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	if err != nil || got == nil {
+		t.Fatalf("被拒绝的更新不应影响库中的行：%v", err)
+	}
+	if !got.ExpiresAt.IsZero() {
+		t.Fatalf("更新被拒后 expires_at 应保持为 NULL，实际 %v", got.ExpiresAt)
+	}
+}
+
+// Test成员角色Update不得改到别的租户的行
+//
+// Update 的 WHERE 带着 tenant_id，这是端口"任何写入都必须以 tenant_id 为条件"
+// 的唯一落地。这里让调用方把授权伪装到另一个租户上真写一次：
+// 数据库必须一所无获，而不是去改别人的行。
+func Test成员角色Update不得改到别的租户的行(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantA, tenantB := uuid.NewV7(), uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantA, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantA, role.KeyOwner)
+	grant := f.mustGrantRole(t, tenantA, membershipID, roleID, time.Time{})
+
+	if err := grant.Revoke("不再需要"); err != nil {
+		t.Fatalf("撤销失败：%v", err)
+	}
+	// 假装这条授权属于租户 B，再走一次更新。
+	grant.TenantID = tenantB.String()
+
+	err := f.memberRoles.Update(f.ctx, grant)
+	if !errors.Is(err, membershiprole.ErrMembershipRoleNotFound) {
+		t.Fatalf("err = %v，期望因租户条件不匹配而记为未命中", err)
+	}
+
+	// 原行必须原样不动：仍在本租户、仍是 active。
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantA, membershipID, roleID)
+	if err != nil || got == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+	if got.Status != membershiprole.StatusActive {
+		t.Fatalf("别的租户的写入不应改动本行，实际状态 %q", got.Status)
+	}
+}
+
+// Test到期授权按到期先后被扫描且失效后不再重复出现
+//
+// 这一条覆盖 ListDueForExpiry 的三件事：
+//   - 长期有效（expires_at 为 NULL）与尚未到期的行都不该被扫出来；
+//   - 到期越久的越靠前（expires_at、id 升序），便于分批与断点续跑；
+//   - 推进为 expired 之后不再重复出现（状态条件把它排除在外）。
+func Test到期授权按到期先后被扫描且失效后不再重复出现(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	keys := []string{role.KeyOwner, role.KeyAdmin, role.KeyMember, role.KeyViewer}
+
+	// 长期有效：expires_at 为 NULL，永远不该被扫出来。
+	f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, keys[0]), time.Time{})
+	// 尚未到期：到期时间在未来。
+	f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, keys[1]), time.Now().Add(time.Hour))
+
+	// 两行已到期：构造函数拒收过去的到期时间，因此先按未来建行，
+	// 再用裸 SQL 把 effective_at / expires_at 一起挪到过去
+	// （仍满足 expires_at > effective_at，不会撞 CHECK）。
+	dueLate := f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, keys[2]), time.Now().Add(time.Hour))
+	dueEarly := f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, keys[3]), time.Now().Add(time.Hour))
+	for _, tc := range []struct {
+		id        string
+		offset    string
+		effective string
+	}{
+		{dueLate.ID, "1 hour", "2 hours"},
+		{dueEarly.ID, "3 hours", "4 hours"},
+	} {
+		if err := f.raw.Exec(
+			"UPDATE membership_roles SET expires_at = now() - interval '"+tc.offset+
+				"', effective_at = now() - interval '"+tc.effective+"' WHERE id = ?",
+			tc.id,
+		).Error; err != nil {
+			t.Fatalf("把授权挪到过去失败：%v", err)
+		}
+	}
+
+	now := time.Now()
+	due, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, now)
+	if err != nil {
+		t.Fatalf("扫描到期授权失败：%v", err)
+	}
+	if len(due) != 2 {
+		t.Fatalf("只应扫出已到期的 2 条，实际 %d", len(due))
+	}
+	// 到期越久的越靠前。
+	if due[0].ID != dueEarly.ID || due[1].ID != dueLate.ID {
+		t.Fatalf("未按 expires_at 升序返回：%s, %s", due[0].ID, due[1].ID)
+	}
+
+	// 逐个推进：now 与扫描时同一个值，两次判定必须一致。
+	for _, grant := range due {
+		if err := grant.Expire(now); err != nil {
+			t.Fatalf("判为到期失败：%v", err)
+		}
+		if err := f.memberRoles.Update(f.ctx, grant); err != nil {
+			t.Fatalf("落库到期状态失败：%v", err)
+		}
+	}
+
+	again, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, time.Now())
+	if err != nil {
+		t.Fatalf("再次扫描失败：%v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("推进为 expired 后不应再被扫出，实际 %d 条", len(again))
+	}
+
+	// 已到期的授权不再算作"未失效"。
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, mustParseUUID(t, dueLate.RoleID))
+	if got != nil || err != nil {
+		t.Fatalf("到期后不应再查到未失效的授权，实际 (%+v, %v)", got, err)
+	}
+}
+
+// Test成员角色的更新时间由触发器维护
+//
+// trg_membership_roles_set_updated_at 独占这一列：应用层给出了值也会被触发器覆盖。
+// 这里先睡一小会儿再改，是为了让新旧值有可比较的先后关系。
+func Test成员角色的更新时间由触发器维护(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+
+	before, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	if err != nil || before == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if err := before.Revoke("离职"); err != nil {
+		t.Fatalf("撤销失败：%v", err)
+	}
+	if err := f.memberRoles.Update(f.ctx, before); err != nil {
+		t.Fatalf("落库撤销失败：%v", err)
+	}
+
+	// 内存里的实体不带最新的 updated_at（应用层不写这一列），
+	// 必须重新查一次才能看到触发器的成果。
+	after, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	if err != nil || after == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+	if after.Status != membershiprole.StatusRevoked || after.Reason != "离职" {
+		t.Fatalf("业务字段未更新：%+v", after)
+	}
+	if !after.UpdatedAt.After(before.UpdatedAt) {
+		t.Fatalf("updated_at 未被触发器推进：%v → %v", before.UpdatedAt, after.UpdatedAt)
 	}
 }
