@@ -21,8 +21,8 @@ type systemRolePreset struct {
 
 // systemRolePresets 是租户创建时预置的系统角色与权限矩阵。
 //
-// 权限只能取自系统权限目录（docs/TDD.md 3.5）；租户管理员后续可在该集合内调整，
-// 但不能新建可执行权限。矩阵可在 Milestone 5 按产品反馈调整。
+// 权限只能取自系统权限目录（见 internal/domain/permission.All）；
+// 租户管理员后续可在该集合内调整，但不能新建可执行权限。
 var systemRolePresets = []systemRolePreset{
 	{
 		key:         role.KeyOwner,
@@ -76,8 +76,16 @@ func NewPlatformSetup(roleRepo role.Repository, permissionRepo permission.Reposi
 	}
 }
 
-// ErrPresetPermissionMissing 表示预置权限不在系统权限目录中。
-var ErrPresetPermissionMissing = errors.New("预置权限缺失于系统权限目录")
+// ErrPresetPermissionMissing 表示预置权限在系统权限目录中存在，但数据库里查不到对应行。
+//
+// 与"权限代码不在系统权限目录中"（permission.ErrUnknownCode）是两回事：
+// 前者是目录与数据库不同步——通常是 seed 还没跑或跑漏了；
+// 后者是代码本身写错了，由 ensureInCatalog 在查库之前拦下。
+//
+// 两者要分开的理由与排障方向直接相关：前者要查部署步骤，
+// 后者要查预置矩阵的源码。错误文案因此也必须说清是哪一种，
+// 不能再笼统地说"缺失于系统权限目录"——那会把人引向错误的方向。
+var ErrPresetPermissionMissing = errors.New("预置权限在系统目录中存在但数据库中缺失")
 
 // EnsureSystemRoles 为租户预置系统角色与默认权限矩阵。
 //
@@ -125,6 +133,11 @@ func (s *platformsetup) lookupPermissions(ctx context.Context, codes []string) (
 	}
 
 	normalized := normalizeCodes(codes)
+	// 先在代码里的目录上校验一遍，再去查库：见 ensureInCatalog 的注释。
+	if err := ensureInCatalog(normalized); err != nil {
+		return nil, err
+	}
+
 	perms, err := s.permissionRepo.FindByCodes(ctx, normalized)
 	if err != nil {
 		return nil, err
@@ -133,6 +146,23 @@ func (s *platformsetup) lookupPermissions(ctx context.Context, codes []string) (
 		return nil, ErrPresetPermissionMissing
 	}
 	return perms, nil
+}
+
+// ensureInCatalog 校验每个权限代码都在代码里的系统目录中。
+//
+// 依据是代码里的系统目录（permission.Lookup）而不是数据库：预置矩阵里的一个笔误，
+// 若只靠查库，要等到某个租户创建的那一刻才会暴露，
+// 而且错误形态是"目录里有、库里没有"（ErrPresetPermissionMissing），
+// 看起来像"数据库没准备好"，很容易被误判成环境问题。
+// 拿目录校验则可以在任何一次执行路径上立刻报出是哪个代码不认识
+// （返回 permission.ErrUnknownCode，与"库里缺行"是两回事）。
+func ensureInCatalog(codes []string) error {
+	for _, code := range codes {
+		if _, ok := permission.Lookup(code); !ok {
+			return fmt.Errorf("%w: %s", permission.ErrUnknownCode, code)
+		}
+	}
+	return nil
 }
 
 // normalizeCodes 归一化并去重权限代码；非法代码被丢弃（前置的 ValidateCodes 已拦截）。

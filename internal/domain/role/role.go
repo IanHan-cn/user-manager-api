@@ -45,6 +45,26 @@ var (
 	ErrNotSystemKey = fmt.Errorf("%w: 该标识不是系统预置角色标识", domain.ErrInvalidKey)
 )
 
+// 写操作的结局错误：三者都以 domain 的基类包装，口径与 membership 包一致，
+// 由适配层按 Repository 端口的约定返回，
+// 调用方既能按本聚合精确判定，也能按基类统一归类。
+var (
+	// ErrRoleExists 表示同一租户下已经存在同 key 的角色。
+	// Create 撞上 idx_roles_tenant_key 唯一约束时必须返回它，
+	// 不得静默吞掉后返回 nil——那会让上层误以为角色已经建好。
+	ErrRoleExists = fmt.Errorf("%w: 角色", domain.ErrAlreadyExists)
+
+	// ErrRoleNotFound 表示要改动的角色不存在，或要为它写权限的角色不属于本租户。
+	// 和 ErrNilRole 的区分见后者的注释：一个是目标缺失，一个是调用方 bug。
+	ErrRoleNotFound = fmt.Errorf("%w: 角色", domain.ErrNotFound)
+
+	// ErrNilRole 表示在一个空角色上执行了写操作。
+	// 以 domain.ErrNilEntity 而不是 ErrRoleNotFound 为基类：
+	// 空实体是调用方 bug（该查没查到、查到却没判空），不是"目标不存在"，
+	// 归到 NotFound 会让上层按 404 返回，把一次程序缺陷伪装成正常的业务结果。
+	ErrNilRole = fmt.Errorf("%w: 角色", domain.ErrNilEntity)
+)
+
 type Role struct {
 	ID          string // 主键
 	TenantID    string // 租户 ID
@@ -54,7 +74,7 @@ type Role struct {
 	Description string // 描述
 
 	CreatedAt time.Time // 创建时间
-	UpdatedAt time.Time //修改时间
+	UpdatedAt time.Time // 修改时间
 }
 
 // 角色标识与名称的长度约束。

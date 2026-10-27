@@ -65,6 +65,19 @@ var (
 	// ErrInvalidUserID 表示用户标识为空或非法。
 	ErrInvalidUserID = fmt.Errorf("%w: 用户标识", ErrInvalidKey)
 
+	// ErrInvalidPermissionID 表示权限标识为空或非法。
+	//
+	// 与 ErrInvalidUserID 同理：它是被别的聚合引用的"另一类业务对象"的标识
+	// ——角色持有哪几项权限，引用的是 permissions 里的行，
+	// 正像成员关系引用 users 里的行那样。因此它留在跨聚合的本包，
+	// 而不是留在持有它的 role 包里，将来再有聚合要引用权限时可直接复用。
+	ErrInvalidPermissionID = fmt.Errorf("%w: 权限标识", ErrInvalidKey)
+
+	// ErrInvalidRoleID 表示角色标识为空或非法。
+	// 与上面几个同属"被别的聚合引用"的词汇：角色权限关联要引用角色，
+	// 将来成员关系持有角色也会引用它，因此定义在本包而不是 role 包。
+	ErrInvalidRoleID = fmt.Errorf("%w: 角色标识", ErrInvalidKey)
+
 	// ErrInvalidActor 表示操作者标识为空或非法。
 	// 操作者指"由谁创建""由谁邀请"这类行为主体，
 	// 例如 tenant 的 CreatedBy、membership 的 InvitedBy。

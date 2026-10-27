@@ -11,7 +11,7 @@ import (
 
 // Logging 记录每个请求的访问日志。
 //
-// 安全约束：不得记录 Authorization 头、请求体或任何凭据（见 docs/TDD.md 10.4）。
+// 安全约束：不得记录 Authorization 头、请求体或任何凭据。
 func Logging() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()

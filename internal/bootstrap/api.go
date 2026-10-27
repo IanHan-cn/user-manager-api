@@ -3,6 +3,7 @@
 package bootstrap
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -52,21 +53,21 @@ func Build() (*Bootstrap, error) {
 	// TODO(redis): 待引入缓存/会话需求后在此初始化 Redis 客户端，并纳入 Close 释放。
 	redisClient, err := OpenRedis(cfg)
 	if err != nil {
-		closeDB(db)
+		CloseDB(db)
 		return nil, fmt.Errorf("open redis: %w", err)
 	}
 
 	// 初始化 Casbin
 	enforcer, err := InitializeCasbin(db)
 	if err != nil {
-		closeDB(db)
+		CloseDB(db)
 		return nil, fmt.Errorf("initialize casbin: %w", err)
 	}
 
 	// 就绪探针
 	readiness, err := NewReadinessChecker(db, enforcer)
 	if err != nil {
-		closeDB(db)
+		CloseDB(db)
 		return nil, fmt.Errorf("initialize readiness checker: %w", err)
 	}
 
@@ -74,17 +75,17 @@ func Build() (*Bootstrap, error) {
 	// 依赖图在此处组装后只以接口形式流入 HTTP 层，不写入 Bootstrap 字段。
 	// TODO(user): 待 ports.Transactor 的 GORM 实现与 user handler 就绪后启用：
 	//   userRepo, err := gormpersist.NewUserRepository(db)
-	//   if err != nil { closeDB(db); return nil, err }
+	//   if err != nil { CloseDB(db); return nil, err }
 	//   tx := gormpersist.NewTransactor(db)
 	//   userSvc, err := user.NewService(userRepo, tx)
-	//   if err != nil { closeDB(db); return nil, err }
+	//   if err != nil { CloseDB(db); return nil, err }
 	// 用例就绪后在此注入 Deps.Users，具体路由由 router 包注册。
 
 	// 初始化认证适配器：ZITADEL 是当前唯一的认证实现，
 	// 对外只以 ports.Authenticator 端口注入。
 	auth, err := zitadelauth.New(cfg.Zitadel, redisClient)
 	if err != nil {
-		closeDB(db)
+		CloseDB(db)
 		return nil, fmt.Errorf("initialize zitadel authenticator: %w", err)
 	}
 
@@ -115,35 +116,27 @@ func (app *Bootstrap) Run() error {
 }
 
 // Close 释放数据库连接等需要显式关闭的资源，供进程入口 defer 调用。
+//
+// 逐项关闭并聚合全部错误：任何一项失败都不应让其余资源被跳过，
+// 否则数据库关闭失败会导致 Redis 连接池泄漏，且失败原因会被掩盖。
 func (app *Bootstrap) Close() error {
-	var err error
+	var errs []error
 	if app.db != nil {
-		err = closeDB(app.db)
+		if err := CloseDB(app.db); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	// Redis 客户端就绪后在此一并关闭。
 	if app.redisClient != nil {
 		if err := app.redisClient.Close(); err != nil {
 			slog.Error("failed to close redis client", "error", err)
-			err = fmt.Errorf("close redis client: %w", err)
-			return err
+			errs = append(errs, fmt.Errorf("close redis client: %w", err))
 		}
 	}
-	if err != nil {
-		return err
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	slog.Info("resources released")
-	return nil
-}
-
-// closeDB 关闭数据库底层连接池；装配失败时也用它回收已获取的资源。
-func closeDB(db *gorm.DB) error {
-	sqlDB, err := db.DB()
-	if err != nil {
-		return fmt.Errorf("获取底层 sql.DB 失败：%w", err)
-	}
-	if err := sqlDB.Close(); err != nil {
-		return fmt.Errorf("关闭数据库连接失败：%w", err)
-	}
 	return nil
 }
 

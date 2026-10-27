@@ -14,7 +14,7 @@ type PolicyPermission struct {
 // PolicyRepository 维护 Casbin 策略在数据库中的投影（casbin_rule 表）与全局版本号。
 //
 // 关键约定：本接口的写入**只能**发生在业务事务内（实现必须走 dbFrom(ctx)），
-// 从而保证"业务关系表 + 策略投影 + 版本号"的原子性（见 docs/TDD.md 8.3）。
+// 从而保证"业务关系表 + 策略投影 + 版本号"的原子性。
 // 绝不能在事务外调用 enforcer 的写入接口，否则事务回滚后策略会残留。
 type PolicyRepository interface {
 	// ReplaceRoleRules 用给定权限集合整体替换某角色在本租户的 p 规则。

@@ -40,10 +40,30 @@ func OpenDB(cfg config.Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxIdleTime(cfg.Database.ConnMaxIdleTime)
 
 	if err := ping(context.Background(), sqlDB, cfg.Database.PingTimeout); err != nil {
-		_ = sqlDB.Close()
+		_ = CloseDB(db)
 		return nil, err
 	}
 	return db, nil
+}
+
+// CloseDB 关闭数据库底层连接池，是 OpenDB 的对称操作。
+//
+// 凡是由 OpenDB 建立的连接，释放时都应调用本函数：
+// 关闭逻辑集中在这里，才不会出现各处自行操作 sql.DB 而行为不一致的情况。
+// 传入 nil 视为无需关闭，直接返回 nil，便于调用方省略判空。
+func CloseDB(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("获取底层 sql.DB 失败：%w", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		return fmt.Errorf("关闭数据库连接失败：%w", err)
+	}
+	return nil
 }
 
 // ping 在有限时间内验证数据库连通性。

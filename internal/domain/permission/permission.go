@@ -28,6 +28,33 @@ var ErrInvalidCode = fmt.Errorf("%w: 权限对外标识", domain.ErrInvalidKey)
 // identPattern 限定资源与操作标识的字符集。
 var identPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// ValidateResource 校验资源标识是否合法：非空、长度不超限、字符集合法。
+//
+// 单列校验而不仅是"拼成 code 再查一次"的原因：
+// permissions 表对 resource 与 action 各有一列 VARCHAR(64)（见 migrations/000004），
+// 而 code 的上限是 VARCHAR(128)——只校验 code 总长会放过
+// "resource 70 字符 + action 短"这种 code 总长合格、单列却超限的取值，
+// 写库时才会被列长度拒绝。
+//
+// 它是目录校验与写库前校验共用的同一把尺子，
+// 保证"目录里的项"与"能写进库的项"永远是同一个范围。
+func ValidateResource(resource string) error {
+	if resource == "" || len(resource) > maxResourceLen || !identPattern.MatchString(resource) {
+		return fmt.Errorf("%w: 资源标识", ErrInvalidCode)
+	}
+	return nil
+}
+
+// ValidateAction 校验操作标识是否合法：非空、长度不超限、字符集合法。
+//
+// 与 ValidateResource 同理，边界取自 permissions 表的 action 列（VARCHAR(64)）。
+func ValidateAction(action string) error {
+	if action == "" || len(action) > maxActionLen || !identPattern.MatchString(action) {
+		return fmt.Errorf("%w: 操作标识", ErrInvalidCode)
+	}
+	return nil
+}
+
 type Permission struct {
 	ID string
 	// Code 是稳定的对外标识，形如 user:read
@@ -51,6 +78,11 @@ func BuildCode(resource, action string) string {
 }
 
 // ParseCode 解析权限代码，非法格式返回 ErrInvalidCode。
+//
+// 校验分三层：code 总长、resource/action 各自的单列长度与字符集。
+// 单列长度之所以要单独校验，是因为 permissions 表给 resource 与 action
+// 各留了 VARCHAR(64)，而 code 自身的上限是 VARCHAR(128)——
+// 只看总长会放过"某一列超限"的取值，写库时才被列长度拒绝。
 func ParseCode(code string) (resource, action string, err error) {
 	code = strings.ToLower(strings.TrimSpace(code))
 	if code == "" || len(code) > maxCodeLen {
@@ -60,8 +92,11 @@ func ParseCode(code string) (resource, action string, err error) {
 	if !found {
 		return "", "", ErrInvalidCode
 	}
-	if !identPattern.MatchString(resource) || !identPattern.MatchString(action) {
-		return "", "", ErrInvalidCode
+	if err := ValidateResource(resource); err != nil {
+		return "", "", err
+	}
+	if err := ValidateAction(action); err != nil {
+		return "", "", err
 	}
 	return resource, action, nil
 }
