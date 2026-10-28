@@ -22,7 +22,7 @@ var futureExpiry = fixedNow.Add(24 * time.Hour)
 // 状态由构造函数固定为 active / pending，这里只是覆写，不绕过任何校验。
 func newInStatus(t *testing.T, status Status) *MembershipRole {
 	t.Helper()
-	r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Time{}, "分配理由")
+	r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "分配理由")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -64,7 +64,7 @@ func TestNew_必填UUID齐全时构造成功(t *testing.T) {
 	roleID := uuid.New()
 	assignedBy := uuid.New()
 
-	r, err := New(tenantID, membershipID, roleID, assignedBy, time.Time{}, "  分配理由  ")
+	r, err := New(tenantID, membershipID, roleID, assignedBy, time.Now(), time.Time{}, "  分配理由  ")
 	if err != nil {
 		t.Fatalf("构造失败：%v", err)
 	}
@@ -115,28 +115,28 @@ func TestNew_零值入参被拒绝(t *testing.T) {
 		{
 			"租户标识为零值",
 			func() (*MembershipRole, error) {
-				return New(uuid.Nil(), uuid.New(), uuid.New(), uuid.New(), time.Time{}, "")
+				return New(uuid.Nil(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "")
 			},
 			domain.ErrInvalidTenantID,
 		},
 		{
 			"成员关系标识为零值",
 			func() (*MembershipRole, error) {
-				return New(uuid.New(), uuid.Nil(), uuid.New(), uuid.New(), time.Time{}, "")
+				return New(uuid.New(), uuid.Nil(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "")
 			},
-			ErrInvalidMembershipID,
+			domain.ErrInvalidMembershipID,
 		},
 		{
 			"角色标识为零值",
 			func() (*MembershipRole, error) {
-				return New(uuid.New(), uuid.New(), uuid.Nil(), uuid.New(), time.Time{}, "")
+				return New(uuid.New(), uuid.New(), uuid.Nil(), uuid.New(), time.Now(), time.Time{}, "")
 			},
 			domain.ErrInvalidRoleID,
 		},
 		{
 			"分配人为零值",
 			func() (*MembershipRole, error) {
-				return New(uuid.New(), uuid.New(), uuid.New(), uuid.Nil(), time.Time{}, "")
+				return New(uuid.New(), uuid.New(), uuid.New(), uuid.Nil(), time.Now(), time.Time{}, "")
 			},
 			domain.ErrInvalidActor,
 		},
@@ -156,15 +156,51 @@ func TestNew_零值入参被拒绝(t *testing.T) {
 	}
 }
 
-// Test构造函数接受未来到期时间并保留取值
-func Test构造函数接受未来到期时间并保留取值(t *testing.T) {
-	expiresAt := time.Now().Add(time.Hour)
-	r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), expiresAt, "")
+// Test构造函数接受未来到期时间并按数据库精度对齐
+//
+// 时间戳一律对齐到 TIMESTAMPTZ 的微秒精度（见 alignToPG）：
+// 纳秒部分留着没有意义——落库时会被截断，而领域层的比较却用它，
+// 于是"应用层判定了、数据库不认"的裂缝就出现了。
+func Test构造函数接受未来到期时间并按数据库精度对齐(t *testing.T) {
+	now := time.Now()
+	expiresAt := now.Add(time.Hour)
+
+	r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), now, expiresAt, "")
 	if err != nil {
 		t.Fatalf("构造失败：%v", err)
 	}
-	if !r.ExpiresAt.Equal(expiresAt) {
-		t.Fatalf("ExpiresAt = %v，期望 %v", r.ExpiresAt, expiresAt)
+
+	want := expiresAt.Truncate(time.Microsecond)
+	if !r.ExpiresAt.Equal(want) {
+		t.Fatalf("ExpiresAt = %v，期望对齐到微秒后的 %v", r.ExpiresAt, want)
+	}
+	// 同一批时间戳用的是同一个来源，且都已对齐。
+	for _, got := range []time.Time{r.AssignedAt, r.EffectiveAt, r.CreatedAt, r.UpdatedAt} {
+		if !got.Equal(now.Truncate(time.Microsecond)) {
+			t.Fatalf("时间戳 = %v，期望对齐到微秒后的 %v", got, now.Truncate(time.Microsecond))
+		}
+	}
+}
+
+// Test到期余量不足一微秒时被拒绝
+//
+// 这是 alignToPG 存在的理由：余量小于数据库精度时，
+// 领域层在纳秒粒度上会判定"晚于"并放行，
+// 落库截断后两者相等，chk_membership_roles_expires_after_effective 随即拒绝——
+// 一次本该在入口拦下的入参错误变成一次数据库冲突。
+func Test到期余量不足一微秒时被拒绝(t *testing.T) {
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+
+	for _, offset := range []time.Duration{0, 1, 500 * time.Nanosecond} {
+		_, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), now, now.Add(offset), "")
+		if !errors.Is(err, ErrInvalidEffectiveRange) {
+			t.Fatalf("余量 %v 应被拒绝，实际 err = %v", offset, err)
+		}
+	}
+
+	// 刚好一个精度单位就必须放行，否则正常的短期授权会被误拒。
+	if _, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), now, now.Add(time.Microsecond), ""); err != nil {
+		t.Fatalf("余量 1µs 应被接受，实际 err = %v", err)
 	}
 }
 
@@ -175,7 +211,7 @@ func Test构造函数接受未来到期时间并保留取值(t *testing.T) {
 func Test失效时间不晚于生效时间被拒绝(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 
-	r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), past, "")
+	r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), past, "")
 	if !errors.Is(err, ErrInvalidEffectiveRange) {
 		t.Fatalf("err = %v，期望 ErrInvalidEffectiveRange", err)
 	}
@@ -190,7 +226,7 @@ func Test失效时间不晚于生效时间被拒绝(t *testing.T) {
 // Test原因超长被拒绝而空白视为未填写
 func Test原因超长被拒绝而空白视为未填写(t *testing.T) {
 	t.Run("超长", func(t *testing.T) {
-		_, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Time{},
+		_, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{},
 			strings.Repeat("理", maxReasonLen+1))
 		if !errors.Is(err, ErrInvalidReason) {
 			t.Fatalf("err = %v，期望 ErrInvalidReason", err)
@@ -198,7 +234,7 @@ func Test原因超长被拒绝而空白视为未填写(t *testing.T) {
 	})
 
 	t.Run("纯空白视为未填写", func(t *testing.T) {
-		r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Time{}, "   ")
+		r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "   ")
 		if err != nil {
 			t.Fatalf("空白原因不该报错：%v", err)
 		}
@@ -208,7 +244,7 @@ func Test原因超长被拒绝而空白视为未填写(t *testing.T) {
 	})
 
 	t.Run("恰好达到上限", func(t *testing.T) {
-		r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Time{},
+		r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{},
 			strings.Repeat("理", maxReasonLen))
 		if err != nil {
 			t.Fatalf("达到上限的原因应被接受：%v", err)
@@ -227,10 +263,10 @@ func Test原因超长被拒绝而空白视为未填写(t *testing.T) {
 func Test系统身份构造函数的分配人为SystemCreator(t *testing.T) {
 	cases := map[string]func() (*MembershipRole, error){
 		"NewSystem": func() (*MembershipRole, error) {
-			return NewSystem(uuid.New(), uuid.New(), uuid.New(), time.Time{}, "")
+			return NewSystem(uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "")
 		},
 		"NewSystemPending": func() (*MembershipRole, error) {
-			return NewSystemPending(uuid.New(), uuid.New(), uuid.New(), time.Time{}, "")
+			return NewSystemPending(uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "")
 		},
 	}
 
@@ -249,7 +285,7 @@ func Test系统身份构造函数的分配人为SystemCreator(t *testing.T) {
 
 // TestPending构造函数的初始状态为待审批
 func TestPending构造函数的初始状态为待审批(t *testing.T) {
-	r, err := NewPending(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Time{}, "")
+	r, err := NewPending(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("构造失败：%v", err)
 	}
@@ -289,8 +325,8 @@ func TestApprove_审批时刻不早于到期时间时被拒绝(t *testing.T) {
 	r := newExpiringInStatus(t, futureExpiry, StatusPending)
 
 	err := r.Approve(futureExpiry.Add(time.Hour))
-	if !errors.Is(err, ErrNotExpirable) {
-		t.Fatalf("err = %v，期望 ErrNotExpirable", err)
+	if !errors.Is(err, ErrAlreadyExpired) {
+		t.Fatalf("err = %v，期望 ErrAlreadyExpired", err)
 	}
 	if r.Status != StatusPending {
 		t.Fatalf("失败后状态不应改变：%q", r.Status)
@@ -394,10 +430,12 @@ func TestExpire_到期推进与两条前置校验(t *testing.T) {
 		}
 	})
 
+	// 长期有效是"查询条件写错了"，未到期是"时机未到"：
+	// 两者分开之后上层才能分清该改查询还是该再等一会儿。
 	t.Run("长期有效的授权不可判为到期", func(t *testing.T) {
 		r := newInStatus(t, StatusActive)
-		if err := r.Expire(fixedNow); !errors.Is(err, ErrNotExpirable) {
-			t.Fatalf("err = %v，期望 ErrNotExpirable", err)
+		if err := r.Expire(fixedNow); !errors.Is(err, ErrNoExpiry) {
+			t.Fatalf("err = %v，期望 ErrNoExpiry", err)
 		}
 		if r.Status != StatusActive {
 			t.Fatalf("失败后状态不应改变：%q", r.Status)
@@ -406,8 +444,8 @@ func TestExpire_到期推进与两条前置校验(t *testing.T) {
 
 	t.Run("未到期不可判为到期", func(t *testing.T) {
 		r := newExpiring(t, futureExpiry)
-		if err := r.Expire(futureExpiry.Add(-time.Minute)); !errors.Is(err, ErrNotExpirable) {
-			t.Fatalf("err = %v，期望 ErrNotExpirable", err)
+		if err := r.Expire(futureExpiry.Add(-time.Minute)); !errors.Is(err, ErrNotYetExpired) {
+			t.Fatalf("err = %v，期望 ErrNotYetExpired", err)
 		}
 		if r.Status != StatusActive {
 			t.Fatalf("失败后状态不应改变：%q", r.Status)
@@ -476,6 +514,186 @@ func Test终态不再转出(t *testing.T) {
 			}
 			if r.Status != from {
 				t.Fatalf("状态被改写为 %q，期望保持 %q", r.Status, from)
+			}
+		})
+	}
+}
+
+// Test状态取值的封闭性判定
+//
+// 未知状态一律判非法（fail closed）：滚动发布时旧版本会读到新版本写入的状态，
+// 那时宁可报错，也不能把它当成"未失效"继续参与鉴权。
+func Test状态取值的封闭性判定(t *testing.T) {
+	cases := map[Status]bool{
+		StatusPending:   true,
+		StatusActive:    true,
+		StatusRevoked:   true,
+		StatusExpired:   true,
+		Status(""):      false,
+		Status("weird"): false,
+		// 大小写不同就是另一个取值：词表是逐字比较的。
+		Status("PENDING"): false,
+	}
+
+	for status, want := range cases {
+		if got := status.Valid(); got != want {
+			t.Errorf("Status(%q).Valid() = %v，期望 %v", status, got, want)
+		}
+	}
+}
+
+// TestValidate拦下绕过构造函数的非法取值
+//
+// 实体的字段是导出的，调用方可以不走构造函数直接改写它们。
+// Validate 是写路径上的入口校验：少了它，非法取值只能等数据库 CHECK 兜底，
+// 上层拿到的是记录级错误而不是可归类的入参错误。
+func TestValidate拦下绕过构造函数的非法取值(t *testing.T) {
+	valid := func() *MembershipRole {
+		r, err := New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), fixedNow, futureExpiry, "分配理由")
+		if err != nil {
+			t.Fatalf("构造失败：%v", err)
+		}
+		return r
+	}
+
+	cases := []struct {
+		name     string
+		mutate   func(r *MembershipRole)
+		want     error
+		wantBase error
+	}{
+		{"主键非法", func(r *MembershipRole) { r.ID = "not-a-uuid" }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"主键为零值", func(r *MembershipRole) { r.ID = uuid.Nil().String() }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		// uuid.Parse 接受但 PostgreSQL 的 uuid 输入函数不接受的几种形态：
+		// 只校验"能解析"会留下"领域层判合法、落库时数据库报 22P02"的裂缝。
+		{"主键带 urn 前缀", func(r *MembershipRole) { r.ID = "urn:uuid:" + r.ID }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"主键带花括号", func(r *MembershipRole) { r.ID = "{" + r.ID + "}" }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"主键无连字符", func(r *MembershipRole) { r.ID = strings.ReplaceAll(r.ID, "-", "") }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"主键为大写", func(r *MembershipRole) { r.ID = strings.ToUpper(r.ID) }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"主键首尾有空白", func(r *MembershipRole) { r.ID = " " + r.ID + " " }, ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"租户标识非法", func(r *MembershipRole) { r.TenantID = "" }, domain.ErrInvalidTenantID, domain.ErrInvalidKey},
+		{"成员关系标识非法", func(r *MembershipRole) { r.MembershipID = "" }, domain.ErrInvalidMembershipID, domain.ErrInvalidKey},
+		{"角色标识非法", func(r *MembershipRole) { r.RoleID = "" }, domain.ErrInvalidRoleID, domain.ErrInvalidKey},
+		{"分配人为纯空白", func(r *MembershipRole) { r.AssignedBy = "   " }, domain.ErrInvalidActor, domain.ErrInvalidKey},
+		{"状态未知", func(r *MembershipRole) { r.Status = Status("weird") }, ErrInvalidStatusValue, domain.ErrInvalidKey},
+		{"状态为空", func(r *MembershipRole) { r.Status = Status("") }, ErrInvalidStatusValue, domain.ErrInvalidKey},
+		{"原因为纯空白", func(r *MembershipRole) { r.Reason = "   " }, ErrInvalidReason, domain.ErrInvalidKey},
+		{"原因超长", func(r *MembershipRole) { r.Reason = strings.Repeat("理", maxReasonLen+1) }, ErrInvalidReason, domain.ErrInvalidKey},
+		{"失效不晚于生效", func(r *MembershipRole) { r.ExpiresAt = r.EffectiveAt }, ErrInvalidEffectiveRange, domain.ErrInvalidKey},
+		{"expired 无到期时间", func(r *MembershipRole) { r.Status = StatusExpired; r.ExpiresAt = time.Time{} }, ErrInvalidMembershipRoleRecord, domain.ErrInvalidState},
+		{"生效时间为零值", func(r *MembershipRole) { r.EffectiveAt = time.Time{} }, ErrInvalidMembershipRoleRecord, domain.ErrInvalidState},
+		{"版本号为零", func(r *MembershipRole) { r.Version = 0 }, ErrInvalidMembershipRoleRecord, domain.ErrInvalidState},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := valid()
+			tc.mutate(r)
+			err := r.Validate()
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v，期望 %v", err, tc.want)
+			}
+			if !errors.Is(err, tc.wantBase) {
+				t.Fatalf("err = %v，应归类到 %v", err, tc.wantBase)
+			}
+		})
+	}
+}
+
+// TestValidate放行构造函数产出的实体与状态转换后的实体
+//
+// 反向用例：入口校验不能误伤正常路径。
+func TestValidate放行构造函数产出的实体与状态转换后的实体(t *testing.T) {
+	for _, status := range []Status{StatusPending, StatusActive} {
+		r, err := newMembershipRole(uuid.New(), uuid.New(), uuid.New(), domain.SystemCreator, status, fixedNow, futureExpiry, "理由")
+		if err != nil {
+			t.Fatalf("构造失败：%v", err)
+		}
+		if err := r.Validate(); err != nil {
+			t.Fatalf("状态 %q 的实体应能通过 Validate，实际 err = %v", status, err)
+		}
+
+		// 终态也要能落库：撤销与到期之后都要写回去。
+		if status == StatusActive {
+			if err := r.Revoke("不再需要"); err != nil {
+				t.Fatalf("撤销失败：%v", err)
+			}
+			if err := r.Validate(); err != nil {
+				t.Fatalf("撤销后的实体应能通过 Validate，实际 err = %v", err)
+			}
+		}
+	}
+}
+
+// TestValidate对空实体返回ErrNilMembershipRole
+func TestValidate对空实体返回ErrNilMembershipRole(t *testing.T) {
+	var r *MembershipRole
+
+	err := r.Validate()
+	if !errors.Is(err, ErrNilMembershipRole) {
+		t.Fatalf("err = %v，期望 ErrNilMembershipRole", err)
+	}
+	if !errors.Is(err, domain.ErrNilEntity) {
+		t.Fatalf("err = %v，应归类到 domain.ErrNilEntity", err)
+	}
+}
+
+// Test各领域错误的基类归属稳定
+//
+// 上层只需对 domain 的基类做 errors.Is 判定即可统一归类，
+// 不必逐个枚举本包的错误——前提是每一个错误的基类都稳定。
+// 这张表把归属固化下来：改任何一个错误的基类都会让这里变红。
+func Test各领域错误的基类归属稳定(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		base error
+	}{
+		{"ErrInvalidStatusTransition", ErrInvalidStatusTransition, domain.ErrInvalidState},
+		{"ErrInvalidStatusValue", ErrInvalidStatusValue, domain.ErrInvalidKey},
+		{"ErrNoExpiry", ErrNoExpiry, domain.ErrInvalidState},
+		{"ErrNotYetExpired", ErrNotYetExpired, domain.ErrInvalidState},
+		{"ErrAlreadyExpired", ErrAlreadyExpired, domain.ErrInvalidState},
+		{"ErrNilMembershipRole", ErrNilMembershipRole, domain.ErrNilEntity},
+		{"ErrInvalidMembershipRoleRecord", ErrInvalidMembershipRoleRecord, domain.ErrInvalidState},
+		{"ErrInvalidReason", ErrInvalidReason, domain.ErrInvalidKey},
+		{"ErrInvalidEffectiveRange", ErrInvalidEffectiveRange, domain.ErrInvalidKey},
+		{"ErrInvalidMembershipRoleID", ErrInvalidMembershipRoleID, domain.ErrInvalidKey},
+		{"ErrMembershipRoleExists", ErrMembershipRoleExists, domain.ErrAlreadyExists},
+		{"ErrMembershipRoleNotFound", ErrMembershipRoleNotFound, domain.ErrNotFound},
+		{"ErrMembershipRoleConflict", ErrMembershipRoleConflict, domain.ErrConflict},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !errors.Is(tc.err, tc.base) {
+				t.Fatalf("%s 未归类到 %v", tc.name, tc.base)
+			}
+		})
+	}
+}
+
+// Test三个到期错误互不串类
+//
+// 拆成三个而不是共用一个的理由就在这里：
+// 上层要能分清"该改查询条件"（NoExpiry）、"该再等等"（NotYetExpired）
+// 与"早该判了"（AlreadyExpired）。可辨识就等价于互不命中。
+func Test三个到期错误互不串类(t *testing.T) {
+	expiryErrors := map[string]error{
+		"ErrNoExpiry":       ErrNoExpiry,
+		"ErrNotYetExpired":  ErrNotYetExpired,
+		"ErrAlreadyExpired": ErrAlreadyExpired,
+	}
+
+	for name, err := range expiryErrors {
+		t.Run(name, func(t *testing.T) {
+			for otherName, other := range expiryErrors {
+				if otherName == name {
+					continue
+				}
+				if errors.Is(err, other) {
+					t.Fatalf("%s 不应同时命中 %s", name, otherName)
+				}
 			}
 		})
 	}

@@ -416,7 +416,7 @@ func Test读路径空标识视为没有依据可查(t *testing.T) {
 func Test读路径非法标识显式报错(t *testing.T) {
 	cases := map[string]error{
 		"非 UUID 字符串": domain.ErrInvalidTenantID,
-		"零值 UUID":      domain.ErrInvalidTenantID,
+		"零值 UUID":    domain.ErrInvalidTenantID,
 	}
 
 	for name, invalid := range cases {

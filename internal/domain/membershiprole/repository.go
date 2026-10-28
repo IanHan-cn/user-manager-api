@@ -53,11 +53,22 @@ import (
 //
 // MembershipRole 是租户边界内的对象，因此：
 //   - 任何写入都必须以 tenant_id 为条件；
-//   - 除 GetByID 外，所有查询都必须带 tenant_id 条件，不得跨租户返回数据；
-//   - 用 GetByID 取回授权后，必须校验返回值的 TenantID 与当前租户一致，
-//     或者直接使用 GetByMembershipAndRole；
+//   - 所有查询都必须带 tenant_id 条件，包括 GetByID，不得跨租户返回数据；
+//     实现方应当把该条件写进查询 helper 内部，而不是交给每个调用点自己拼——
+//     交给调用点就等于"迟早漏一处"，而漏掉的后果是跨租户读到一行；
+//   - 租户内的日常鉴权用 GetByMembershipAndRole：它按 (tenant_id, membership_id, role_id)
+//     三者定位，取回结果不必再校验归属；
 //   - tenant_id 是冗余列、没有外键兜底（见 migrations/000009 的表注释），
 //     上面这些条件是把租户边界落到 SQL 上的唯一防线。
+//
+// # 成员关系状态
+//
+// 本端口只管授权自己（membership_roles）这一张表，不 join memberships：
+// 因此"这条成员关系是否仍然有效"（是否已离开租户、是否被暂停）
+// 不在查询结果里体现。调用方若要把授权用于鉴权，
+// 必须另行确认成员关系本身仍处于有效状态——
+// 这是应用层的职责：适配层负责数据归属（跨不跨租户），
+// 业务有效性归业务规则。
 //
 // # 重新分配
 //
@@ -101,18 +112,45 @@ type Repository interface {
 	// Update 更新一条角色授权的可变字段。
 	//
 	// 不可写的列为 id、tenant_id、membership_id、role_id、assigned_by、
-	// assigned_at、created_at、updated_at 八项：
+	// assigned_at、created_at、updated_at、expires_at 九项：
 	// 前四者是一次授权的业务键与归属，换了其中任何一个就已是另一次授权，
 	// 而不是"改了一下"；assigned_by / assigned_at 记录授权动作本身，不可覆写，
 	// 否则"谁授的权"会被事后改写；created_at 不可变，updated_at 归触发器维护。
-	// 真正会被写入的只有 status、reason、effective_at、expires_at、version 五项：
+	//
+	// expires_at 也在不可写之列：到期时间由构造函数一次性决定，
+	// 三条状态转换（Approve / Revoke / Expire）都不改它。
+	// 允许覆写它等于允许把一条有期限的授权改成永久有效——
+	// 一次没带 ExpiresAt 的 Update 就会静默造成这个后果。
+	// 将来要支持续期，请另开专门的端口方法（例如 ExtendExpiry），
+	// 由领域层校验新的到期时间，而不是放开整列。
+	//
+	// 真正会被写入的只有 status、reason、effective_at、version 四项：
 	// version 是乐观锁令牌，实现方在更新成功时自增它。
 	//
-	// 乐观锁：实现方必须以调用方读到的 version 作为更新前提。
-	// 前提对不上说明这行已被他人改过，必须返回 ErrMembershipRoleConflict，
-	// 不得静默覆盖——那会把一次撤销无声地回滚掉。
+	// 实现方必须以调用方读到的 version 作为更新前提，并且必须排除终态行：
+	//   - 前提对不上说明这行已被他人改过 → ErrMembershipRoleConflict；
+	//   - 落在终态行上说明要改的是一条历史 → ErrInvalidStatusTransition，
+	//     终态是历史，改它等于"复活"一次已撤销的授权。
+	// 命中 0 行时实现方要取回该行加以区分，不得一律报成冲突：
+	// 都报冲突的话调用方会"重新读取再重试"，而终态行重试多少次都不会成功。
+	//
 	// 实现方负责在更新成功后把调用方实体的 version 自增，
 	// 调用方据此可以对同一行发起下一次更新，不必先重新查询。
+	//
+	// 实现方会校验整个实体的自洽性（取值合法、标识规范、状态在词表内、
+	// 有效期自洽等），因此调用方必须传入读回后的**完整实体**，
+	// 不支持只带少数字段的部分更新。
+	// 这一点必须写明：否则调用方会按"只改 status 就只传 status"的直觉写，
+	// 结果被实现方以"成员关系标识为空或非法"拒绝，
+	// 错误信息还会让人以为是数据坏了而不是用法不对。
+	//
+	// 实现方**不重放状态机的规则**：状态转换的合法性由调用方经领域方法
+	// （Approve / Revoke / Expire）保证，Update 只负责把结果持久化。
+	// 之所以这样分工：转换规则只有领域层知道，适配层复制一份必然随领域层漂移。
+	// 调用方若绕过领域方法直接改导出字段再 Update，
+	// 实现方只拦得住终态行（见上一段）与取值不合法的字段；
+	// 好在鉴权读路径独立地按 status 与 expires_at 过滤，
+	// 被绕过的转换不会因此带来额外的授权。
 	//
 	// 更新必须以 tenant_id 为条件（见类型注释的"租户隔离"小节）：
 	// 传入的授权归属与库中不一致时按未命中处理，
@@ -125,9 +163,11 @@ type Repository interface {
 	Update(ctx context.Context, r *MembershipRole) error
 
 	// GetByID 按主键查询授权，未命中返回 (nil, nil)。
-	// 本方法不带 tenant_id 条件，取回后必须校验 TenantID，
-	// 或直接改用 GetByMembershipAndRole。
-	GetByID(ctx context.Context, id uuid.UUID) (*MembershipRole, error)
+	//
+	// 必须带 tenant_id 条件：本表 tenant_id 是没有外键兜底的冗余列
+	// （见类型注释的"租户隔离"小节），少了它一次查询就能读到别的租户的行。
+	// 租户内的日常鉴权请改用 GetByMembershipAndRole。
+	GetByID(ctx context.Context, tenantID, id uuid.UUID) (*MembershipRole, error)
 
 	// GetByMembershipAndRole 查询指定成员关系在指定角色上"尚未失效"的那条授权，
 	// 未命中返回 (nil, nil)。
@@ -184,8 +224,19 @@ type Repository interface {
 	// 排序刻意按 expires_at、id 升序而不是 created_at：
 	// 到期越久的越该先处理，且同一批内顺序稳定，便于分批与断点续跑。
 	//
+	// limit 是本次最多返回多少条，由调用方给出且必须为正整数：
+	// 这条查询没有上限时，服务中断几小时后恢复的积压量
+	// 会在一次调用里全部读进内存。分批即反复调用本方法，
+	// 已推进的行不再满足 status 条件，下一批自然是剩下的。
+	//
+	// limit 不是正整数时实现方必须返回 domain.ErrInvalidLimit，
+	// 而不是返回空切片：上限为 0 与"确实没有到期授权"对调用方是完全不同的两件事，
+	// 用空结果表达无效入参会让到期推进任务静默空转，
+	// 而"直到返回条数小于上限才停"的分批循环还会因此永不结束。
+	// 这与"标识为零值返回空切片"是两种语义，不要混为一谈。
+	//
 	// 调用方应当把本次的 now 一路传给 Expire：
 	// "扫出来的一批"与"逐个判死"必须用同一时刻，
 	// 否则中途跨过某个 expires_at 会让两次判定得出不同结论。
-	ListDueForExpiry(ctx context.Context, tenantID uuid.UUID, now time.Time) ([]*MembershipRole, error)
+	ListDueForExpiry(ctx context.Context, tenantID uuid.UUID, now time.Time, limit int) ([]*MembershipRole, error)
 }

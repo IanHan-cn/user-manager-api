@@ -78,6 +78,14 @@ var (
 	// 将来成员关系持有角色也会引用它，因此定义在本包而不是 role 包。
 	ErrInvalidRoleID = fmt.Errorf("%w: 角色标识", ErrInvalidKey)
 
+	// ErrInvalidMembershipID 表示成员关系标识为空或非法。
+	//
+	// 与 ErrInvalidPermissionID 同理：成员关系这一行被别的聚合引用
+	// ——成员角色授权持有的就是 memberships 里的行，
+	// 因此它属于跨聚合词汇，定义在本包而不是 membership 包，
+	// 引用方不必反向依赖 memberships 的持有者。
+	ErrInvalidMembershipID = fmt.Errorf("%w: 成员关系标识", ErrInvalidKey)
+
 	// ErrInvalidActor 表示操作者标识为空或非法。
 	// 操作者指"由谁创建""由谁邀请"这类行为主体，
 	// 例如 tenant 的 CreatedBy、membership 的 InvitedBy。
@@ -97,6 +105,15 @@ var (
 	// 提示文案与其它字段级错误保持一致，只写字段名：
 	// 具体的长度上限由 MaxNameLen 统一给出，不在这里重复写死。
 	ErrInvalidName = fmt.Errorf("%w: 名称", ErrInvalidKey)
+
+	// ErrInvalidLimit 表示查询或批量的条数上限不是正整数。
+	//
+	// 之所以不用"返回空结果"来表达：上限为 0 与"确实没有符合条件的数据"
+	// 对调用方是完全不同的两件事——前者要修配置，后者才是正常结束。
+	// 用空结果表达无效入参会让批量任务静默空转
+	// （扫不到 ⇒ 不推进 ⇒ 过期数据一直留着），
+	// 而"直到返回条数小于上限才停"的分批循环还会因此永不结束。
+	ErrInvalidLimit = fmt.Errorf("%w: 条数上限", ErrInvalidKey)
 )
 
 // ErrNilEntity 是所有"调用方传入了空实体"错误的基类错误。

@@ -20,7 +20,7 @@ import (
 // newTestMembershipRole 造一条领域层认可的角色授权，供错误翻译用例取用标识。
 func newTestMembershipRole(t *testing.T) *membershiprole.MembershipRole {
 	t.Helper()
-	r, err := membershiprole.New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Time{}, "分配理由")
+	r, err := membershiprole.New(uuid.New(), uuid.New(), uuid.New(), uuid.New(), time.Now(), time.Time{}, "分配理由")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -109,8 +109,11 @@ func Test成员角色查询方法遇到零值标识不查库(t *testing.T) {
 
 	t.Run("单条查询返回 (nil, nil)", func(t *testing.T) {
 		cases := map[string]func() (*membershiprole.MembershipRole, error){
-			"GetByID": func() (*membershiprole.MembershipRole, error) {
-				return r.GetByID(ctx, uuid.Nil())
+			"GetByID 主键为零值": func() (*membershiprole.MembershipRole, error) {
+				return r.GetByID(ctx, uuid.New(), uuid.Nil())
+			},
+			"GetByID 租户为零值": func() (*membershiprole.MembershipRole, error) {
+				return r.GetByID(ctx, uuid.Nil(), uuid.New())
 			},
 			"GetByMembershipAndRole 租户为零值": func() (*membershiprole.MembershipRole, error) {
 				return r.GetByMembershipAndRole(ctx, uuid.Nil(), uuid.New(), uuid.New(), time.Now())
@@ -147,7 +150,7 @@ func Test成员角色查询方法遇到零值标识不查库(t *testing.T) {
 				return r.ListByRoleID(ctx, uuid.New(), uuid.Nil())
 			},
 			"ListDueForExpiry 租户为零值": func() ([]*membershiprole.MembershipRole, error) {
-				return r.ListDueForExpiry(ctx, uuid.Nil(), time.Now())
+				return r.ListDueForExpiry(ctx, uuid.Nil(), time.Now(), 100)
 			},
 		}
 		for name, call := range cases {
@@ -199,7 +202,10 @@ func Test成员角色往返转换保留有效期与原因(t *testing.T) {
 		t.Fatalf("撤销失败：%v", err)
 	}
 
-	got := toMembershipRoleRecord(r).toEntity()
+	got, err := toMembershipRoleRecord(r).toEntity()
+	if err != nil {
+		t.Fatalf("还原实体失败：%v", err)
+	}
 	if got.Status != membershiprole.StatusRevoked {
 		t.Fatalf("状态 = %q，期望 revoked", got.Status)
 	}
@@ -296,15 +302,16 @@ func Test成员角色遇到未识别的数据库错误原样上抛(t *testing.T)
 	}
 }
 
-// Test成员角色Update命中零行时的两种结局
+// Test成员角色Update命中零行时的三种结局
 //
-// Update 的 WHERE 带着版本号前提，命中 0 行有两种原因：
-// 目标行不存在（调用方 bug，404），或目标行已被他人改过（409）。
+// Update 的 WHERE 带着版本号与"非终态"两个前提，命中 0 行有三种原因：
+// 目标行不存在（调用方 bug，404）、目标行已是终态（改它等于复活，409 状态类）、
+// 目标行存在且非终态但版本号对不上（已被他人改过，409 冲突类）。
 // 这条判定必须能脱离数据库单独验证——命中 0 行之后的分支
 // 在集成测试里要靠 Docker 才能跑到。
-func Test成员角色Update命中零行时的两种结局(t *testing.T) {
+func Test成员角色Update命中零行时的三种结局(t *testing.T) {
 	t.Run("目标行不存在", func(t *testing.T) {
-		err := classifyMembershipRoleUpdate(false, "some-id")
+		err := classifyMembershipRoleUpdate(false, "", "some-id")
 		if !errors.Is(err, membershiprole.ErrMembershipRoleNotFound) {
 			t.Fatalf("err = %v，期望 ErrMembershipRoleNotFound", err)
 		}
@@ -313,8 +320,38 @@ func Test成员角色Update命中零行时的两种结局(t *testing.T) {
 		}
 	})
 
+	t.Run("库里是不认识的状态", func(t *testing.T) {
+		err := classifyMembershipRoleUpdate(true, "weird", "some-id")
+		// 取值问题，不是"终态不可改"：两者的处置方向完全不同。
+		if !errors.Is(err, membershiprole.ErrInvalidStatusValue) {
+			t.Fatalf("err = %v，期望 ErrInvalidStatusValue", err)
+		}
+		if !errors.Is(err, domain.ErrInvalidKey) {
+			t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
+		}
+		if errors.Is(err, membershiprole.ErrInvalidStatusTransition) {
+			t.Fatalf("err = %v，未知状态不应被误报为终态", err)
+		}
+	})
+
+	t.Run("目标行已是终态", func(t *testing.T) {
+		err := classifyMembershipRoleUpdate(true, string(membershiprole.StatusRevoked), "some-id")
+		// 终态是历史，改它等于复活一次已撤销的授权：
+		// 报状态类错误，不报冲突类——后者会让调用方"重新读取再重试"，
+		// 而终态行重试多少次都不会成功。
+		if !errors.Is(err, membershiprole.ErrInvalidStatusTransition) {
+			t.Fatalf("err = %v，期望 ErrInvalidStatusTransition", err)
+		}
+		if !errors.Is(err, domain.ErrInvalidState) {
+			t.Fatalf("err = %v，应归类到 domain.ErrInvalidState", err)
+		}
+		if errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("err = %v，终态不应归类到 domain.ErrConflict", err)
+		}
+	})
+
 	t.Run("目标行已被他人改过", func(t *testing.T) {
-		err := classifyMembershipRoleUpdate(true, "some-id")
+		err := classifyMembershipRoleUpdate(true, string(membershiprole.StatusActive), "some-id")
 		if !errors.Is(err, membershiprole.ErrMembershipRoleConflict) {
 			t.Fatalf("err = %v，期望 ErrMembershipRoleConflict", err)
 		}
@@ -333,10 +370,14 @@ func Test成员角色Update命中零行时的两种结局(t *testing.T) {
 // 一次授权的业务键换了任何一个都已是另一次授权，不是"改了一下"；
 // assigned_by / assigned_at 记录授权动作本身，允许覆写就等于允许事后改写
 // "谁授的权、什么时候授的"；created_at 不可变、updated_at 归触发器维护。
+//
+// expires_at 也在禁止之列：它在白名单里时，一次没带 ExpiresAt 的 Update
+// 会把库里的到期时间静默写成 NULL，一条有期限的授权就此变成永久有效。
 func Test成员角色可写列白名单排除业务键与授权动作(t *testing.T) {
 	forbidden := []string{
 		"id", "tenant_id", "membership_id", "role_id",
 		"assigned_by", "assigned_at", "created_at", "updated_at",
+		"expires_at",
 	}
 	for _, col := range forbidden {
 		for _, allowed := range membershipRoleUpdatableColumns {
@@ -346,13 +387,32 @@ func Test成员角色可写列白名单排除业务键与授权动作(t *testing
 		}
 	}
 
-	want := []string{"status", "reason", "effective_at", "expires_at", "version"}
+	want := []string{"status", "reason", "effective_at", "version"}
 	if len(membershipRoleUpdatableColumns) != len(want) {
 		t.Fatalf("白名单 = %v，期望 %v", membershipRoleUpdatableColumns, want)
 	}
 	for i := range want {
 		if membershipRoleUpdatableColumns[i] != want[i] {
 			t.Fatalf("白名单第 %d 项 = %q，期望 %q", i, membershipRoleUpdatableColumns[i], want[i])
+		}
+	}
+}
+
+// Test成员角色Update的列值对与白名单逐项一致
+//
+// 两份清单必须同步：Select 用的是白名单切片，Updates 用的是列值对 map。
+// 只往一处加列的后果是"该写的字段没写"——静默的数据错误，
+// 而只断言白名单内容（上一版就是这么做的）根本发现不了。
+func Test成员角色Update的列值对与白名单逐项一致(t *testing.T) {
+	updateMap := toMembershipRoleRecord(newTestMembershipRole(t)).toUpdateMap()
+
+	if len(updateMap) != len(membershipRoleUpdatableColumns) {
+		t.Fatalf("列值对有 %d 项，白名单有 %d 项，两者必须逐项对应",
+			len(updateMap), len(membershipRoleUpdatableColumns))
+	}
+	for _, col := range membershipRoleUpdatableColumns {
+		if _, ok := updateMap[col]; !ok {
+			t.Fatalf("列值对里缺少白名单列 %q", col)
 		}
 	}
 }
@@ -374,5 +434,42 @@ func Test未失效状态集合与部分唯一索引条件一致(t *testing.T) {
 		if !want[s] {
 			t.Fatalf("集合包含不该有的状态 %q", s)
 		}
+	}
+}
+
+// Test还原实体时校验状态取值
+//
+// 滚动发布时旧版本会读到新版本写入的状态。
+// 让"读到一个不认识的状态"成为可归类的错误，
+// 而不是让它以"未失效"的身份混进鉴权结果。
+//
+// 注意这条只能单测：chk_membership_roles_status 会挡住非法状态写入，
+// 真库里造不出这样的行。
+func Test还原实体时校验状态取值(t *testing.T) {
+	r := newTestMembershipRole(t)
+
+	rec := toMembershipRoleRecord(r)
+	got, err := rec.toEntity()
+	if err != nil {
+		t.Fatalf("合法状态不应报错：%v", err)
+	}
+	if got.Status != r.Status {
+		t.Fatalf("Status = %q，期望 %q", got.Status, r.Status)
+	}
+
+	for _, bad := range []membershiprole.Status{membershiprole.Status("weird"), membershiprole.Status("")} {
+		t.Run(string(bad), func(t *testing.T) {
+			rec.Status = string(bad)
+			got, err := rec.toEntity()
+			if got != nil {
+				t.Fatalf("非法状态不应返回实体：%+v", got)
+			}
+			if !errors.Is(err, membershiprole.ErrInvalidStatusValue) {
+				t.Fatalf("err = %v，期望 ErrInvalidStatusValue", err)
+			}
+			if !errors.Is(err, domain.ErrInvalidKey) {
+				t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
+			}
+		})
 	}
 }

@@ -53,8 +53,12 @@ func fromNullableTime(t *time.Time) time.Time {
 // toNullableString 把领域层的空串转成库里的 NULL。
 //
 // 与时间那一对同一口径：可空文本列以 NULL 表示"没填"，
-// 空串写进去会撞上 btrim(col) <> '' 一类的 CHECK
+// 空串写进去会撞上"要求去空白后不为空"一类的 CHECK
 // （见 membership_roles.reason 与 chk_membership_roles_reason）。
+//
+// 约束条件写成描述而不是 SQL 字面量，是因为 gofmt 的 doc comment 重排
+// 会把 ASCII 的双单引号（两个单引号）转成排版引号，
+// 写成字面量等于让注释在下次格式化时自动变形。
 func toNullableString(s string) *string {
 	if s == "" {
 		return nil

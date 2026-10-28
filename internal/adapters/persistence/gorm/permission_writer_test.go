@@ -206,10 +206,10 @@ func Test目录同步_库中多余的权限不计入任何一项(t *testing.T) {
 	entries := diffCatalogTestEntries()
 
 	current := map[string]string{
-		"tenant:read":     "查看租户信息",
-		"legacy:removed":  "早已下线的权限",
-		"member:invite":   "邀请成员加入租户",
-		"tenant:update":   "修改租户信息",
+		"tenant:read":    "查看租户信息",
+		"legacy:removed": "早已下线的权限",
+		"member:invite":  "邀请成员加入租户",
+		"tenant:update":  "修改租户信息",
 	}
 
 	result, toWrite := diffCatalog(entries, current)

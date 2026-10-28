@@ -83,6 +83,19 @@ func runIntegrationSuite(m *testing.M) int {
 	db, stop, err := startPostgres()
 	if err != nil {
 		skipIntegration = fmt.Sprintf("启动 Postgres 容器失败：%v", err)
+
+		// CI 上不可跳过：本文件覆盖的正是只有真库能证明的约定——
+		// 部分唯一索引、五条 CHECK、set_updated_at 触发器。
+		// 跳过它们之后 CI 的结果是 PASS，
+		// 一次缺失的基础设施会被当成一次通过，这些约定从此无人看守。
+		// 本地没有 Docker 时仍然跳过，不把环境问题变成开发阻塞。
+		if os.Getenv("CI") != "" {
+			fmt.Fprintf(os.Stderr,
+				"\n错误：%s\nCI 环境下集成用例不可跳过：本包依赖真实数据库的约定将无人看守。\n\n",
+				skipIntegration)
+			return 1
+		}
+
 		fmt.Fprintf(os.Stderr,
 			"\n告警：%s\n本包 %s 依赖真实数据库的用例将被跳过；"+
 				"其余不需要数据库的单元测试照常执行。\n\n",
@@ -626,7 +639,7 @@ func (f integrationFixture) mustGrantRole(
 ) *membershiprole.MembershipRole {
 	t.Helper()
 
-	grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, expiresAt, "")
+	grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Now(), expiresAt, "")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -665,7 +678,7 @@ func Test成员角色重复授权同一角色返回已存在且撤销后可重�
 	first := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
 
 	// 未失效的授权重复插入：撞上部分唯一索引。
-	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Now(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -740,7 +753,7 @@ func Test成员角色失效时间不晚于生效时间被数据库拒绝(t *test
 		t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
 	}
 
-	got, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	got, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
 	if err != nil || got == nil {
 		t.Fatalf("被拒绝的更新不应影响库中的行：%v", err)
 	}
@@ -824,7 +837,7 @@ func Test到期授权按到期先后被扫描且失效后不再重复出现(t *t
 	}
 
 	now := time.Now()
-	due, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, now)
+	due, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, now, 100)
 	if err != nil {
 		t.Fatalf("扫描到期授权失败：%v", err)
 	}
@@ -846,7 +859,7 @@ func Test到期授权按到期先后被扫描且失效后不再重复出现(t *t
 		}
 	}
 
-	again, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, time.Now())
+	again, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, time.Now(), 100)
 	if err != nil {
 		t.Fatalf("再次扫描失败：%v", err)
 	}
@@ -874,7 +887,7 @@ func Test成员角色的更新时间由触发器维护(t *testing.T) {
 	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
 	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
 
-	before, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	before, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
 	if err != nil || before == nil {
 		t.Fatalf("取回授权失败：%v", err)
 	}
@@ -889,7 +902,7 @@ func Test成员角色的更新时间由触发器维护(t *testing.T) {
 
 	// 内存里的实体不带最新的 updated_at（应用层不写这一列），
 	// 必须重新查一次才能看到触发器的成果。
-	after, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	after, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
 	if err != nil || after == nil {
 		t.Fatalf("取回授权失败：%v", err)
 	}
@@ -906,6 +919,10 @@ func Test成员角色的更新时间由触发器维护(t *testing.T) {
 // 验证基于整型 version 的乐观锁：
 // 当管理员 A 持有旧版本（version=1）尝试更新时，若记录已被管理员 B 并发修改（version 已变为 2），
 // 仓储层必须拒绝静默覆盖，并准确抛出 ErrMembershipRoleConflict。
+//
+// 这里让 B 只推进版本号而不改状态（行仍是 active）：
+// 冲突与终态是两种不同的结局，分开验证才不会互相掩盖——
+// 详见同文件的"终态授权不可被复活"。
 func Test成员角色乐观锁版本号冲突(t *testing.T) {
 	f := newIntegrationFixture(t)
 
@@ -920,17 +937,17 @@ func Test成员角色乐观锁版本号冲突(t *testing.T) {
 	}
 
 	// 2. 模拟管理员 A 读取并持有一份内存副本（携带 version = 1）
-	replicaA, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	replicaA, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
 	if err != nil {
 		t.Fatalf("取回授权失败：%v", err)
 	}
 
-	// 3. 模拟管理员 B 先一步修改了这条记录（执行了撤销并成功落库，触发 version 在库中自增为 2）
-	if err := grant.Revoke("管理员B合规撤销"); err != nil {
-		t.Fatalf("撤销失败：%v", err)
-	}
-	if err := f.memberRoles.Update(f.ctx, grant); err != nil {
-		t.Fatalf("管理员B落库更新失败：%v", err)
+	// 3. 模拟管理员 B 先一步修改了这条记录（version 在库中自增为 2，行仍是 active）。
+	//    用裸 SQL 只推版本号、不碰状态，是为了把"版本号对不上"这一种结局单独拎出来。
+	if err := f.raw.Exec(
+		"UPDATE membership_roles SET version = version + 1 WHERE id = ?", grant.ID,
+	).Error; err != nil {
+		t.Fatalf("推进版本号失败：%v", err)
 	}
 
 	// 4. 管理员 A 尝试基于其手中的陈旧副本（version = 1）进行 Update
@@ -939,6 +956,62 @@ func Test成员角色乐观锁版本号冲突(t *testing.T) {
 	err = f.memberRoles.Update(f.ctx, replicaA)
 	if !errors.Is(err, membershiprole.ErrMembershipRoleConflict) {
 		t.Fatalf("err = %v，期望触发并发冲突 ErrMembershipRoleConflict", err)
+	}
+}
+
+// Test终态授权不可被复活
+//
+// 状态机（canTransition）只守护 Approve / Revoke / Expire 三个领域方法，
+// 管不到"读入一条 revoked 的行、把导出的 Status 字段改成 active 再 Update"
+// 这条路径。少了 Update 的终态守卫，一次已撤销的授权就能被静默复活，
+// 并立刻出现在鉴权查询结果里——这是权限提升。
+//
+// 这里显式复现那个攻击动作：取回 revoked 的行、改成 active、落库。
+func Test终态授权不可被复活(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+	if err := grant.Revoke("管理员合规撤销"); err != nil {
+		t.Fatalf("撤销失败：%v", err)
+	}
+	if err := f.memberRoles.Update(f.ctx, grant); err != nil {
+		t.Fatalf("落库撤销失败：%v", err)
+	}
+
+	// 攻击者取回这条已撤销的行，直接把状态改成 active 再落库。
+	revoked, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
+	if err != nil || revoked == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+	if revoked.Status != membershiprole.StatusRevoked {
+		t.Fatalf("前置条件不成立：状态应为 revoked，实际 %q", revoked.Status)
+	}
+	revoked.Status = membershiprole.StatusActive
+
+	err = f.memberRoles.Update(f.ctx, revoked)
+	if !errors.Is(err, membershiprole.ErrInvalidStatusTransition) {
+		t.Fatalf("err = %v，期望 ErrInvalidStatusTransition", err)
+	}
+	if !errors.Is(err, domain.ErrInvalidState) {
+		t.Fatalf("err = %v，应归类到 domain.ErrInvalidState", err)
+	}
+	// 不能报成冲突：那会让调用方"重新读取再重试"，
+	// 而终态行重试多少次都不会成功。
+	if errors.Is(err, membershiprole.ErrMembershipRoleConflict) {
+		t.Fatalf("err = %v，终态不应被误报成并发冲突", err)
+	}
+
+	// 库里的那一行必须仍是 revoked：一次被拒绝的写入不能留下任何痕迹。
+	after, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
+	if err != nil || after == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+	if after.Status != membershiprole.StatusRevoked {
+		t.Fatalf("被拒绝的写入不应改变状态，实际 %q", after.Status)
 	}
 }
 
@@ -987,7 +1060,7 @@ func Test已到期未推进的授权不参与鉴权也不挡住重新分配(t *t
 	}
 
 	// 二、重新分配不能被它挡住：Create 先推进再插入。
-	regrant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	regrant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Now(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -996,7 +1069,7 @@ func Test已到期未推进的授权不参与鉴权也不挡住重新分配(t *t
 	}
 
 	// 旧行必须被推进为 expired，而不是留在 active 上继续占着唯一槽位。
-	old, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	old, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
 	if err != nil || old == nil {
 		t.Fatalf("取回旧行失败：%v", err)
 	}
@@ -1030,7 +1103,7 @@ func Test未到期的授权仍然占用唯一约束(t *testing.T) {
 
 	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Now().Add(time.Hour))
 
-	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Now(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -1039,7 +1112,7 @@ func Test未到期的授权仍然占用唯一约束(t *testing.T) {
 	}
 
 	// 尚未到期的行不得被推进：它还是生效的授权。
-	still, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	still, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
 	if err != nil || still == nil {
 		t.Fatalf("取回授权失败：%v", err)
 	}
@@ -1093,7 +1166,7 @@ func Test成员角色主键冲突归入主键重复(t *testing.T) {
 	grant := f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyOwner), time.Time{})
 
 	// 换一条全新的业务键，只复用主键：撞的应当是主键而不是业务唯一索引。
-	dup, err := membershiprole.NewSystem(tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyAdmin), time.Time{}, "")
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyAdmin), time.Now(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -1121,7 +1194,7 @@ func Test成员角色原因超长归入字段级错误(t *testing.T) {
 	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
 	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
 
-	grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Now(), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("构造授权失败：%v", err)
 	}
@@ -1139,5 +1212,557 @@ func Test成员角色原因超长归入字段级错误(t *testing.T) {
 	// 记录级错误是 409 语义，与字段级错误不能混。
 	if errors.Is(err, membershiprole.ErrInvalidMembershipRoleRecord) {
 		t.Fatalf("err = %v，字段级错误不应归入记录级错误", err)
+	}
+}
+
+// Test成员角色五条CHECK在真库上都拒绝
+//
+// 领域层的 Validate 已经能在入口拦下这些取值，
+// 但 CHECK 是最后一道防线：绕过领域层直接写库时必须仍然挡住。
+// 这里用裸 SQL 绕过入口校验，逐条确认数据库真的会拒绝，
+// 且拒绝时 GORM 的翻译能认出这是 CHECK 违反——
+// 否则上层拿到的是驱动原生错误而不是可归类的领域错误。
+func Test成员角色五条CHECK在真库上都拒绝(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Now().Add(time.Hour))
+
+	cases := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"状态取值越界", "UPDATE membership_roles SET status = ? WHERE id = ?", []any{"paused", grant.ID}},
+		{"分配人为纯空白", "UPDATE membership_roles SET assigned_by = ? WHERE id = ?", []any{"   ", grant.ID}},
+		{"失效不晚于生效", "UPDATE membership_roles SET expires_at = effective_at WHERE id = ?", []any{grant.ID}},
+		{"expired 无到期时间", "UPDATE membership_roles SET status = ?, expires_at = NULL WHERE id = ?", []any{string(membershiprole.StatusExpired), grant.ID}},
+		{"原因为纯空白", "UPDATE membership_roles SET reason = ? WHERE id = ?", []any{"   ", grant.ID}},
+		{"原因超长", "UPDATE membership_roles SET reason = ? WHERE id = ?", []any{strings.Repeat("理", 513), grant.ID}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := f.raw.Exec(tc.sql, tc.args...).Error
+			if err == nil {
+				t.Fatalf("数据库应拒绝：%s", tc.name)
+			}
+			if !errors.Is(err, gorm.ErrCheckConstraintViolated) {
+				t.Fatalf("err = %v，期望归入 gorm.ErrCheckConstraintViolated", err)
+			}
+
+			// 行必须原样不动：拒绝的写入不能留下半截状态。
+			got, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
+			if err != nil || got == nil {
+				t.Fatalf("取回授权失败：%v", err)
+			}
+			if got.Status != membershiprole.StatusActive {
+				t.Fatalf("被拒绝的写入不应改变状态，实际 %q", got.Status)
+			}
+			if got.ExpiresAt.IsZero() {
+				t.Fatal("被拒绝的写入不应清空到期时间")
+			}
+		})
+	}
+}
+
+// Test成员角色Update不改写不可写列
+//
+// 白名单是"不可写"约定的唯一落地：Select 只放行四列，
+// 传入实体里的其余字段一律不进 SET 子句。
+// 这条用例把不可写的列全改一遍再落库，逐列确认库里的值没动——
+// 其中 ExpiresAt 最关键：把它清零也要写不进去，
+// 否则一条有期限的临时授权会被静默改成永久有效。
+func Test成员角色Update不改写不可写列(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Now().Add(time.Hour))
+
+	before, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
+	if err != nil || before == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+
+	// 把不可写的列全部改掉，只保留 id 与 tenant_id 作为 WHERE 的条件。
+	mutated := *before
+	mutated.MembershipID = uuid.NewV7().String()
+	mutated.RoleID = uuid.NewV7().String()
+	mutated.AssignedBy = "篡改进来的人"
+	mutated.AssignedAt = time.Now().Add(-1000 * time.Hour)
+	mutated.CreatedAt = time.Now().Add(-2000 * time.Hour)
+	mutated.UpdatedAt = time.Now().Add(-3000 * time.Hour)
+	// 关键：到期时间清零也不该写进去（expires_at 已移出可写列）。
+	mutated.ExpiresAt = time.Time{}
+	// 可写的三列：状态、原因与生效时间。
+	mutated.Status = membershiprole.StatusRevoked
+	mutated.Reason = "撤销理由"
+	mutated.EffectiveAt = before.EffectiveAt.Add(time.Minute)
+
+	if err := f.memberRoles.Update(f.ctx, &mutated); err != nil {
+		t.Fatalf("落库撤销失败：%v", err)
+	}
+
+	after, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, grant.ID))
+	if err != nil || after == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+
+	// 不可写的列必须原样不动。
+	if after.MembershipID != before.MembershipID {
+		t.Fatalf("MembershipID 被改写：%q → %q", before.MembershipID, after.MembershipID)
+	}
+	if after.RoleID != before.RoleID {
+		t.Fatalf("RoleID 被改写：%q → %q", before.RoleID, after.RoleID)
+	}
+	if after.AssignedBy != before.AssignedBy {
+		t.Fatalf("AssignedBy 被改写：%q → %q", before.AssignedBy, after.AssignedBy)
+	}
+	if !after.AssignedAt.Equal(before.AssignedAt) {
+		t.Fatalf("AssignedAt 被改写：%v → %v", before.AssignedAt, after.AssignedAt)
+	}
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Fatalf("CreatedAt 被改写：%v → %v", before.CreatedAt, after.CreatedAt)
+	}
+	if !after.ExpiresAt.Equal(before.ExpiresAt) {
+		t.Fatalf("ExpiresAt 被改写：%v → %v", before.ExpiresAt, after.ExpiresAt)
+	}
+	// updated_at 归触发器：传入的值被覆盖，且一定推进了。
+	if !after.UpdatedAt.After(before.UpdatedAt) {
+		t.Fatalf("updated_at 未被触发器推进：%v → %v", before.UpdatedAt, after.UpdatedAt)
+	}
+
+	// 可写的三列必须生效，版本号必须自增。
+	if after.Status != membershiprole.StatusRevoked {
+		t.Fatalf("Status = %q，期望 revoked", after.Status)
+	}
+	if after.Reason != "撤销理由" {
+		t.Fatalf("Reason = %q，期望撤销理由", after.Reason)
+	}
+	if !after.EffectiveAt.Equal(mutated.EffectiveAt) {
+		t.Fatalf("EffectiveAt = %v，期望 %v", after.EffectiveAt, mutated.EffectiveAt)
+	}
+	if after.Version != before.Version+1 {
+		t.Fatalf("Version = %d，期望 %d", after.Version, before.Version+1)
+	}
+}
+
+// Test待审批授权的完整流程在真库上成立
+//
+// pending 这条分支此前在真库上从未跑过：
+// 本包的核心特性是"pending → active 的审批流"，
+// 而所有集成用例都只造 active 行。
+// 这里把"pending 占槽位、不参与鉴权、审批后改写生效时间"逐条钉住。
+func Test待审批授权的完整流程在真库上成立(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	now := time.Now()
+
+	pending, err := membershiprole.NewSystemPending(tenantID, membershipID, roleID, now, time.Time{}, "待审批")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, pending); err != nil {
+		t.Fatalf("写入授权失败：%v", err)
+	}
+
+	// pending 也算"未失效"：它占着部分唯一索引的槽位。
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID, now)
+	if err != nil || got == nil {
+		t.Fatalf("pending 授权应能被取回，实际 (%+v, %v)", got, err)
+	}
+	if got.Status != membershiprole.StatusPending {
+		t.Fatalf("Status = %q，期望 pending", got.Status)
+	}
+
+	// pending 不参与鉴权：生效列表里没有它。
+	active, err := f.memberRoles.ListActiveByMembershipID(f.ctx, tenantID, membershipID, now)
+	if err != nil {
+		t.Fatalf("查询生效授权失败：%v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("pending 不应出现在生效列表里，实际 %d 条", len(active))
+	}
+
+	// pending 同样占用唯一槽位：同一对取值不能再分配。
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, now, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, dup); !errors.Is(err, membershiprole.ErrMembershipRoleExists) {
+		t.Fatalf("err = %v，期望 ErrMembershipRoleExists", err)
+	}
+
+	// 审批通过并落库。
+	approveAt := now.Add(time.Minute)
+	if err := pending.Approve(approveAt); err != nil {
+		t.Fatalf("审批失败：%v", err)
+	}
+	if err := f.memberRoles.Update(f.ctx, pending); err != nil {
+		t.Fatalf("落库审批失败：%v", err)
+	}
+
+	after, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, pending.ID))
+	if err != nil || after == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+	if after.Status != membershiprole.StatusActive {
+		t.Fatalf("Status = %q，期望 active", after.Status)
+	}
+	// 审批时刻才是真正开始生效的时刻。
+	if !after.EffectiveAt.Equal(approveAt.Truncate(time.Microsecond)) {
+		t.Fatalf("EffectiveAt = %v，期望审批时刻 %v", after.EffectiveAt, approveAt)
+	}
+	// 分配时间记录授权动作本身，审批不得改写它。
+	if !after.AssignedAt.Equal(now.Truncate(time.Microsecond)) {
+		t.Fatalf("AssignedAt = %v，不应被审批改写", after.AssignedAt)
+	}
+
+	// 审批之后就该出现在生效列表里了。
+	active, err = f.memberRoles.ListActiveByMembershipID(f.ctx, tenantID, membershipID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("查询生效授权失败：%v", err)
+	}
+	if len(active) != 1 || active[0].ID != pending.ID {
+		t.Fatalf("生效列表应只有审批通过的那一条，实际 %d 条", len(active))
+	}
+}
+
+// Test生效列表与角色反向列表在真库上正确
+//
+// ListActiveByMembershipID 被端口注释标为"鉴权热路径"，ListByRoleID 是同一个
+// 多对多关联的反向查询，此前两者在真库上都是零覆盖：
+// 条件或排序写错只有线上鉴权出问题才会被发现。
+func Test生效列表与角色反向列表在真库上正确(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantA, tenantB := uuid.NewV7(), uuid.NewV7()
+	membershipA := f.mustCreateMembership(t, tenantA, uuid.NewV7())
+	membershipB := f.mustCreateMembership(t, tenantB, uuid.NewV7())
+	now := time.Now()
+
+	// 同一个成员关系上三条：active（长期有效）、revoked、pending。
+	activeGrant := f.mustGrantRole(t, tenantA, membershipA, f.mustCreateRole(t, tenantA, role.KeyOwner), time.Time{})
+	roleAdmin := f.mustCreateRole(t, tenantA, role.KeyAdmin)
+	revokedGrant := f.mustGrantRole(t, tenantA, membershipA, roleAdmin, time.Time{})
+	if err := revokedGrant.Revoke("不再需要"); err != nil {
+		t.Fatalf("撤销失败：%v", err)
+	}
+	if err := f.memberRoles.Update(f.ctx, revokedGrant); err != nil {
+		t.Fatalf("落库撤销失败：%v", err)
+	}
+	pendingGrant, err := membershiprole.NewSystemPending(tenantA, membershipA, f.mustCreateRole(t, tenantA, role.KeyMember), now, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, pendingGrant); err != nil {
+		t.Fatalf("写入授权失败：%v", err)
+	}
+
+	// 生效列表只含 active 的那一条。
+	active, err := f.memberRoles.ListActiveByMembershipID(f.ctx, tenantA, membershipA, now)
+	if err != nil {
+		t.Fatalf("查询生效授权失败：%v", err)
+	}
+	if len(active) != 1 || active[0].ID != activeGrant.ID {
+		t.Fatalf("生效列表应只有 active 的那一条，实际 %d 条", len(active))
+	}
+
+	// 历史列表含全部三条（含终态与 pending）。
+	all, err := f.memberRoles.ListByMembershipID(f.ctx, tenantA, membershipA)
+	if err != nil {
+		t.Fatalf("查询授权列表失败：%v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("历史列表应有 3 条，实际 %d 条", len(all))
+	}
+
+	// 反向：按角色查被授予给哪些成员关系。
+	byRole, err := f.memberRoles.ListByRoleID(f.ctx, tenantA, roleAdmin)
+	if err != nil {
+		t.Fatalf("按角色查询失败：%v", err)
+	}
+	if len(byRole) != 1 || byRole[0].ID != revokedGrant.ID {
+		t.Fatalf("按角色查询应返回那条终态历史行，实际 %d 条", len(byRole))
+	}
+
+	// 别租户的行不会串进来：反向查询同样带租户条件。
+	f.mustGrantRole(t, tenantB, membershipB, f.mustCreateRole(t, tenantB, role.KeyOwner), time.Time{})
+	otherTenant, err := f.memberRoles.ListByRoleID(f.ctx, tenantA, roleAdmin)
+	if err != nil {
+		t.Fatalf("按角色查询失败：%v", err)
+	}
+	if len(otherTenant) != 1 {
+		t.Fatalf("别租户的行不应串进结果，实际 %d 条", len(otherTenant))
+	}
+
+	// 生效列表也不含别租户的授权。
+	activeB, err := f.memberRoles.ListActiveByMembershipID(f.ctx, tenantA, membershipB, now)
+	if err != nil {
+		t.Fatalf("查询生效授权失败：%v", err)
+	}
+	if len(activeB) != 0 {
+		t.Fatalf("别租户的成员关系不应出现在租户 A 的生效列表里，实际 %d 条", len(activeB))
+	}
+}
+
+// Test读路径不跨租户返回数据
+//
+// 端口要求"除 GetByID 外所有查询都必须带 tenant_id"——
+// 而 GetByID 现在也带上了。少了任何一个条件就是一次跨租户数据读取，
+// 而此前没有任何用例验证过读路径的租户隔离。
+func Test读路径不跨租户返回数据(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantA, tenantB := uuid.NewV7(), uuid.NewV7()
+	membershipA := f.mustCreateMembership(t, tenantA, uuid.NewV7())
+	roleA := f.mustCreateRole(t, tenantA, role.KeyOwner)
+	grantA := f.mustGrantRole(t, tenantA, membershipA, roleA, time.Time{})
+	now := time.Now()
+
+	// 用租户 B 的标识去查租户 A 的授权：全部应为空而不是错误。
+	got, err := f.memberRoles.GetByID(f.ctx, tenantB, mustParseUUID(t, grantA.ID))
+	if got != nil || err != nil {
+		t.Fatalf("跨租户的 GetByID 应返回 (nil, nil)，实际 (%+v, %v)", got, err)
+	}
+
+	got, err = f.memberRoles.GetByMembershipAndRole(f.ctx, tenantB, membershipA, roleA, now)
+	if got != nil || err != nil {
+		t.Fatalf("跨租户的 GetByMembershipAndRole 应返回 (nil, nil)，实际 (%+v, %v)", got, err)
+	}
+
+	for name, list := range map[string]func() ([]*membershiprole.MembershipRole, error){
+		"ListByMembershipID": func() ([]*membershiprole.MembershipRole, error) {
+			return f.memberRoles.ListByMembershipID(f.ctx, tenantB, membershipA)
+		},
+		"ListActiveByMembershipID": func() ([]*membershiprole.MembershipRole, error) {
+			return f.memberRoles.ListActiveByMembershipID(f.ctx, tenantB, membershipA, now)
+		},
+		"ListByRoleID": func() ([]*membershiprole.MembershipRole, error) {
+			return f.memberRoles.ListByRoleID(f.ctx, tenantB, roleA)
+		},
+		"ListDueForExpiry": func() ([]*membershiprole.MembershipRole, error) {
+			return f.memberRoles.ListDueForExpiry(f.ctx, tenantB, now, 100)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rows, err := list()
+			if err != nil {
+				t.Fatalf("%s 不应报错：%v", name, err)
+			}
+			if len(rows) != 0 {
+				t.Fatalf("%s 不应返回租户 A 的数据，实际 %d 条", name, len(rows))
+			}
+		})
+	}
+
+	// 反向确认：用本租户的标识能取回，证明上面的空不是因为数据没写进去。
+	got, err = f.memberRoles.GetByID(f.ctx, tenantA, mustParseUUID(t, grantA.ID))
+	if err != nil || got == nil || got.ID != grantA.ID {
+		t.Fatalf("本租户应能取回自己的授权，实际 (%+v, %v)", got, err)
+	}
+
+	rows, err := f.memberRoles.ListByMembershipID(f.ctx, tenantA, membershipA)
+	if err != nil {
+		t.Fatalf("查询授权列表失败：%v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("本租户应能看到自己的那条授权，实际 %d 条", len(rows))
+	}
+}
+
+// Test跨租户的成员关系或角色创建授权被拒绝
+//
+// 本表全仓一律不加外键（见 migrations/000009 的表注释），
+// 引用完整性只能由写路径保证。少了归属校验，
+// 租户 A 的 id 配上租户 B 的成员关系就能静默落库，
+// 此后按 (tenant_id=A, membership_id=B成员) 查询照样查得到它。
+func Test跨租户的成员关系或角色创建授权被拒绝(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantA, tenantB := uuid.NewV7(), uuid.NewV7()
+	membershipA := f.mustCreateMembership(t, tenantA, uuid.NewV7())
+	membershipB := f.mustCreateMembership(t, tenantB, uuid.NewV7())
+	roleA := f.mustCreateRole(t, tenantA, role.KeyOwner)
+	roleB := f.mustCreateRole(t, tenantB, role.KeyOwner)
+	now := time.Now()
+
+	cases := []struct {
+		name  string
+		grant func() (*membershiprole.MembershipRole, error)
+		want  error
+	}{
+		{
+			"成员关系属于别的租户",
+			func() (*membershiprole.MembershipRole, error) {
+				return membershiprole.NewSystem(tenantA, membershipB, roleA, now, time.Time{}, "")
+			},
+			domain.ErrInvalidMembershipID,
+		},
+		{
+			"角色属于别的租户",
+			func() (*membershiprole.MembershipRole, error) {
+				return membershiprole.NewSystem(tenantA, membershipA, roleB, now, time.Time{}, "")
+			},
+			domain.ErrInvalidRoleID,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			grant, err := tc.grant()
+			if err != nil {
+				t.Fatalf("构造授权失败：%v", err)
+			}
+			err = f.memberRoles.Create(f.ctx, grant)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v，期望 %v", err, tc.want)
+			}
+			if !errors.Is(err, domain.ErrInvalidKey) {
+				t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
+			}
+		})
+	}
+
+	// 归属一致时照常写入：校验不能误伤正常路径。
+	grant, err := membershiprole.NewSystem(tenantA, membershipA, roleA, now, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, grant); err != nil {
+		t.Fatalf("归属一致时应能写入，实际 err = %v", err)
+	}
+}
+
+// Test写入入口拦下绕过构造函数的非法取值
+//
+// Create 与 Update 都先走 MembershipRole.Validate：
+// 实体的字段是导出的，调用方可以不走构造函数直接改写它们。
+// 少了这一道，非法取值只能等数据库 CHECK 兜底，
+// 上层拿到的是记录级错误而不是可归类的入参错误。
+func Test写入入口拦下绕过构造函数的非法取值(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	now := time.Now()
+
+	newGrant := func() *membershiprole.MembershipRole {
+		grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, now, time.Time{}, "")
+		if err != nil {
+			t.Fatalf("构造授权失败：%v", err)
+		}
+		return grant
+	}
+
+	t.Run("Create", func(t *testing.T) {
+		grant := newGrant()
+		grant.AssignedBy = "   "
+
+		err := f.memberRoles.Create(f.ctx, grant)
+		if !errors.Is(err, domain.ErrInvalidActor) {
+			t.Fatalf("err = %v，期望 domain.ErrInvalidActor", err)
+		}
+		if !errors.Is(err, domain.ErrInvalidKey) {
+			t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
+		}
+		// 入口就该拒绝，不能落到数据库去撞 CHECK。
+		if errors.Is(err, gorm.ErrCheckConstraintViolated) {
+			t.Fatalf("err = %v，应在入口拦下而不是等数据库拒绝", err)
+		}
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		stored := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+		loaded, err := f.memberRoles.GetByID(f.ctx, tenantID, mustParseUUID(t, stored.ID))
+		if err != nil || loaded == nil {
+			t.Fatalf("取回授权失败：%v", err)
+		}
+		loaded.Status = membershiprole.Status("weird")
+
+		err = f.memberRoles.Update(f.ctx, loaded)
+		if !errors.Is(err, membershiprole.ErrInvalidStatusValue) {
+			t.Fatalf("err = %v，期望 ErrInvalidStatusValue", err)
+		}
+		if errors.Is(err, gorm.ErrCheckConstraintViolated) {
+			t.Fatalf("err = %v，应在入口拦下而不是等数据库拒绝", err)
+		}
+	})
+}
+
+// Test到期扫描按上限截断并优先返回到期最久的
+//
+// limit 是这条定时任务热路径的护栏：没有上限时，
+// 服务中断后恢复的积压量会在一次调用里全部读进内存。
+func Test到期扫描按上限截断并优先返回到期最久的(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+
+	// 三条都已到期（构造函数拒收过去的到期时间，故先建未来的再挪到过去）。
+	grants := []*membershiprole.MembershipRole{
+		f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyOwner), time.Now().Add(time.Hour)),
+		f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyAdmin), time.Now().Add(time.Hour)),
+		f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyMember), time.Now().Add(time.Hour)),
+	}
+	// 两个时刻要一起挪：chk_membership_roles_expires_after_effective 要求
+	// expires_at 严格晚于 effective_at，只挪前者会让约束拒绝。
+	// effective_at 统一挪到 5 小时前，expires_at 各挪不同的小时数，
+	// 到期先后因此由 expires_at 决定。
+	for i, tc := range []struct {
+		id       string
+		expireAt string
+	}{
+		{grants[0].ID, "1"},
+		{grants[1].ID, "3"},
+		{grants[2].ID, "2"},
+	} {
+		// 用参数拼出 interval：直接写 "interval ?" 在 PostgreSQL 里不是合法的
+		// 参数位置（语法错误 42601），因此把小时数作为文本参数参与构造。
+		if err := f.raw.Exec(
+			"UPDATE membership_roles SET"+
+				" expires_at = now() - (? || ' hours')::interval,"+
+				" effective_at = now() - interval '5 hours'"+
+				" WHERE id = ?",
+			tc.expireAt, tc.id,
+		).Error; err != nil {
+			t.Fatalf("把第 %d 条授权挪到过去失败：%v", i, err)
+		}
+	}
+
+	now := time.Now()
+
+	// 只要两条：上限必须生效。
+	batch, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, now, 2)
+	if err != nil {
+		t.Fatalf("扫描到期授权失败：%v", err)
+	}
+	if len(batch) != 2 {
+		t.Fatalf("上限为 2 时应返回 2 条，实际 %d 条", len(batch))
+	}
+	// 到期最久的排在前面：3 小时前到期的那条应当第一。
+	if batch[0].ID != grants[1].ID {
+		t.Fatalf("第一条 = %s，期望到期最久的 %s", batch[0].ID, grants[1].ID)
+	}
+	if batch[1].ID != grants[2].ID {
+		t.Fatalf("第二条 = %s，期望次久的 %s", batch[1].ID, grants[2].ID)
+	}
+
+	// 上限不是正整数时必须报错，而不是返回空切片：
+	// 上限为 0 与"确实没有到期授权"是两件不同的事，
+	// 用空结果表达无效入参会让到期推进任务静默空转
+	// （扫不到 ⇒ 不推进 ⇒ 过期数据一直留着），
+	// 而"直到返回条数小于上限才停"的分批循环还会因此永不结束。
+	if _, err := f.memberRoles.ListDueForExpiry(f.ctx, tenantID, now, 0); !errors.Is(err, domain.ErrInvalidLimit) {
+		t.Fatalf("err = %v，期望 domain.ErrInvalidLimit", err)
 	}
 }

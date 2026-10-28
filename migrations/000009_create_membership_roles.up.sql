@@ -120,14 +120,25 @@ CREATE INDEX IF NOT EXISTS idx_membership_roles_tenant_membership
 CREATE INDEX IF NOT EXISTS idx_membership_roles_tenant_role
     ON membership_roles (tenant_id, role_id);
 
--- 支撑 ListDueForExpiry：定时任务按 (tenant_id, status, expires_at <= now)
--- 扫描到期未处理的授权，再逐行调用 Expire + Update。
--- 三个列顺序与查询条件一致，扫描走索引前缀。
+-- 支撑 ListDueForExpiry：定时任务按 (tenant_id, expires_at <= now) 扫描
+-- 到期未处理的授权，再逐行调用 Expire + Update；结果按 expires_at、id 排序。
+--
+-- 列序刻意是 (tenant_id, expires_at, id) 而不是把 status 放在中间：
+-- 查询里的 status IN ('pending', 'active') 有两个取值，
+-- 索引一旦以 status 为第二列，扫描就要在两个 status 分支上各走一遍再归并，
+-- 归并之后仍需要一次显式排序。去掉 status 之后，
+-- tenant_id 等值 + expires_at 范围 + id 排序全部由索引顺序直接给出，
+-- status 只作为回表后的过滤条件。
+--
+-- 代价要说清楚：status 不在索引里，已失效的历史行（revoked / expired）
+-- 仍带着过去的 expires_at，会被扫描取回再回表过滤掉，
+-- 冗余随历史量增长。取舍是这样：到期扫描是定时任务的热路径，
+-- 而授权历史量通常远小于活跃量。
 --
 -- 本索引是"expired 由定时任务推进"这一决策的落地：
 -- 没有它，定时任务只能全量扫一个租户的授权行再在应用层过滤。
-CREATE INDEX IF NOT EXISTS idx_membership_roles_tenant_status_expires
-    ON membership_roles (tenant_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_membership_roles_due
+    ON membership_roles (tenant_id, expires_at, id);
 
 -- 由数据库强制维护 updated_at，函数来自 000001_init_functions。
 CREATE TRIGGER trg_membership_roles_set_updated_at
@@ -138,6 +149,6 @@ CREATE TRIGGER trg_membership_roles_set_updated_at
 COMMENT ON TABLE membership_roles IS '成员角色授权，(membership_id, role_id) 在未失效的授权间唯一，撤销后可重新分配';
 COMMENT ON COLUMN membership_roles.tenant_id IS '租户归属，与 memberships.tenant_id 一致，用于把租户条件下推到本表';
 COMMENT ON COLUMN membership_roles.assigned_by IS '分配人用户 ID，系统分配时为 system';
-COMMENT ON COLUMN membership_roles.effective_at IS '生效时间，当前恒等于分配时间，不提供预约未来生效';
+COMMENT ON COLUMN membership_roles.effective_at IS '生效时间，不提供预约未来生效。pending 阶段为分配时刻的占位，审批通过时改写为审批时刻';
 COMMENT ON COLUMN membership_roles.expires_at IS '失效时间，NULL 表示长期有效；到期由定时任务改写 status 为 expired';
 COMMENT ON COLUMN membership_roles.reason IS '变更原因，由最近一次变更覆写';
