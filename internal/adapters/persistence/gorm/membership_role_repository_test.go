@@ -335,7 +335,7 @@ func Test成员角色可写列白名单排除业务键与授权动作(t *testing
 		}
 	}
 
-	want := []string{"status", "reason", "effective_at", "expires_at"}
+	want := []string{"status", "reason", "effective_at", "expires_at", "version"}
 	if len(membershipRoleUpdatableColumns) != len(want) {
 		t.Fatalf("白名单 = %v，期望 %v", membershipRoleUpdatableColumns, want)
 	}

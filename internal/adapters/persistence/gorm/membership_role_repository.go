@@ -1,3 +1,4 @@
+// internal/adapters/persistence/gorm/membership_role_repository.go
 package gorm
 
 import (
@@ -50,6 +51,7 @@ type membershipRoleRecord struct {
 	Reason       *string    `gorm:"column:reason"`
 	CreatedAt    time.Time  `gorm:"column:created_at"`
 	UpdatedAt    time.Time  `gorm:"column:updated_at;<-:false"`
+	Version      int        `gorm:"column:version"` // 映射 version 列
 }
 
 // TableName 固定表名为 membership_roles，不依赖 GORM 默认的复数转换。
@@ -67,6 +69,7 @@ var membershipRoleUpdatableColumns = []string{
 	"reason",
 	"effective_at",
 	"expires_at",
+	"version", // 允许更新 version
 }
 
 // membershipRoleNotExpiredStatuses 是"尚未失效"的状态集合。
@@ -95,6 +98,7 @@ func toMembershipRoleRecord(r *membershiprole.MembershipRole) membershipRoleReco
 		Reason:       toNullableString(r.Reason),
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
+		Version:      r.Version,
 	}
 }
 
@@ -113,6 +117,7 @@ func (r membershipRoleRecord) toEntity() *membershiprole.MembershipRole {
 		Reason:       fromNullableString(r.Reason),
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
+		Version:      r.Version,
 	}
 }
 
@@ -126,6 +131,7 @@ func (r membershipRoleRecord) toUpdateMap() map[string]any {
 		"reason":       r.Reason,
 		"effective_at": r.EffectiveAt,
 		"expires_at":   r.ExpiresAt,
+		"version":      gorm.Expr("version + 1"), // 更新时自动加 1
 	}
 }
 
@@ -189,6 +195,7 @@ func (r *MembershipRoleRepository) Create(ctx context.Context, m *membershiprole
 // 这也是端口"任何写入都必须以 tenant_id 为条件"的落地。
 //
 // 只写 membershipRoleUpdatableColumns 列出的列，updated_at 由触发器维护，本方法不写。
+// Update 更新一条角色授权的可变字段，加入乐观锁与并发冲突检测。
 func (r *MembershipRoleRepository) Update(ctx context.Context, m *membershiprole.MembershipRole) error {
 	if m == nil {
 		return membershiprole.ErrNilMembershipRole
@@ -204,12 +211,40 @@ func (r *MembershipRoleRepository) Update(ctx context.Context, m *membershiprole
 
 	rec := toMembershipRoleRecord(m)
 	db := dBFromContext(ctx, r.db)
+
+	// 核心：WHERE 条件中加入 version = m.Version 乐观锁校验
 	result := db.WithContext(ctx).
 		Model(&membershipRoleRecord{}).
-		Where("id = ? AND tenant_id = ?", m.ID, m.TenantID).
+		Where("id = ? AND tenant_id = ? AND version = ?", m.ID, m.TenantID, m.Version).
 		Select(membershipRoleUpdatableColumns).
 		Updates(rec.toUpdateMap())
-	return translateMembershipRoleUpdateResult(result, m)
+
+	if result.Error != nil {
+		return translateMembershipRoleWriteError(result.Error, m)
+	}
+
+	// 影响行数为 0 时，判定是“数据不存在（404）”还是“并发冲突被修改（409）”
+	if result.RowsAffected == 0 {
+		var existing membershipRoleRecord
+		err := db.WithContext(ctx).
+			Select("id").
+			Where("id = ? AND tenant_id = ?", m.ID, m.TenantID).
+			Take(&existing).Error
+
+		if err != nil {
+			if isRecordNotFound(err) {
+				return fmt.Errorf("%w: id=%s", membershiprole.ErrMembershipRoleNotFound, m.ID)
+			}
+			return fmt.Errorf("检查成员角色授权是否存在失败：%w", err)
+		}
+
+		// 记录存在，但 version 对不上 -> 说明被其他人并发修改过
+		return membershiprole.ErrMembershipRoleConflict
+	}
+
+	// 更新成功后，同步自增内存实体的版本号，方便后续连续调用
+	m.Version++
+	return nil
 }
 
 // GetByID 按主键查询授权，未命中返回 (nil, nil)。

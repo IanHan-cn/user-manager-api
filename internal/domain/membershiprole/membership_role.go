@@ -1,3 +1,4 @@
+// interval/domain/membershiprole/membership_role.go
 // Package membershiprole 定义成员关系与角色之间的授权关联实体、状态机与持久化端口。
 //
 // 分层约束：本包属于 Domain，不得依赖 Gin、GORM、Redis 或 Casbin。
@@ -81,6 +82,7 @@ type MembershipRole struct {
 	Reason       string    // 变更原因，由最近一次变更覆写；空串表示未填写
 	CreatedAt    time.Time // 创建时间
 	UpdatedAt    time.Time // 最后更新时间
+	Version      int       // 乐观锁版本号
 }
 
 // 租户标识、成员关系标识、角色标识、操作者标识的错误不定义在本包：
@@ -160,6 +162,10 @@ var (
 	// 静默成功会让上层误以为更新生效。
 	// 查询类方法未命中按端口约定返回 (nil, nil)，不使用本错误。
 	ErrMembershipRoleNotFound = fmt.Errorf("%w: 成员角色授权", domain.ErrNotFound)
+
+	// ErrMembershipRoleConflict 表示该授权在并发修改时已被其他人更新（乐观锁冲突）。
+	// 适配层应当将其翻译为 HTTP 409 Conflict，防止静默覆盖。
+	ErrMembershipRoleConflict = fmt.Errorf("%w: 成员角色授权已被其他人修改", domain.ErrConflict)
 )
 
 // New 构造一条立即生效的角色授权，status 为 active。
@@ -255,6 +261,7 @@ func newMembershipRole(
 		Reason:       normalizedReason,
 		CreatedAt:    now,
 		UpdatedAt:    now,
+		Version:      1, // 初始版本号为 1
 	}, nil
 }
 

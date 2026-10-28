@@ -1,3 +1,4 @@
+// internal/adapters/persistence/gorm/integration_test.go
 package gorm
 
 // 本文件对本包的 SQL 做端到端校验：起一个真实的 Postgres 容器，
@@ -885,5 +886,46 @@ func Test成员角色的更新时间由触发器维护(t *testing.T) {
 	}
 	if !after.UpdatedAt.After(before.UpdatedAt) {
 		t.Fatalf("updated_at 未被触发器推进：%v → %v", before.UpdatedAt, after.UpdatedAt)
+	}
+}
+
+// Test成员角色乐观锁版本号冲突
+//
+// 验证基于整型 version 的乐观锁：
+// 当管理员 A 持有旧版本（version=1）尝试更新时，若记录已被管理员 B 并发修改（version 已变为 2），
+// 仓储层必须拒绝静默覆盖，并准确抛出 ErrMembershipRoleConflict。
+func Test成员角色乐观锁版本号冲突(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+
+	// 1. 初始创建一个授权（初始 version 应为 1）
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+	if grant.Version != 1 {
+		t.Fatalf("初始 version 应为 1，实际 %d", grant.Version)
+	}
+
+	// 2. 模拟管理员 A 读取并持有一份内存副本（携带 version = 1）
+	replicaA, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	if err != nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+
+	// 3. 模拟管理员 B 先一步修改了这条记录（执行了撤销并成功落库，触发 version 在库中自增为 2）
+	if err := grant.Revoke("管理员B合规撤销"); err != nil {
+		t.Fatalf("撤销失败：%v", err)
+	}
+	if err := f.memberRoles.Update(f.ctx, grant); err != nil {
+		t.Fatalf("管理员B落库更新失败：%v", err)
+	}
+
+	// 4. 管理员 A 尝试基于其手中的陈旧副本（version = 1）进行 Update
+	// 因为 replicaA 里的 Version 已经落后于数据库当前的 Version (2)，
+	// WHERE 条件无法命中，仓储层应识别并发冲突并准确抛出 ErrMembershipRoleConflict。
+	err = f.memberRoles.Update(f.ctx, replicaA)
+	if !errors.Is(err, membershiprole.ErrMembershipRoleConflict) {
+		t.Fatalf("err = %v，期望触发并发冲突 ErrMembershipRoleConflict", err)
 	}
 }

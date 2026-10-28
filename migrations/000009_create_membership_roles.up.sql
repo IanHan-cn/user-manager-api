@@ -1,3 +1,4 @@
+-- migrations/000009_create_membership_roles.up.sql
 -- 成员角色授权关联表，对应 domain/membershiprole.MembershipRole。
 --
 -- 一条记录刻画"某成员关系在某租户中被授予某个角色"这一次授权：
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS membership_roles (
 
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    version INT NOT NULL DEFAULT 1,
 
     CONSTRAINT chk_membership_roles_status CHECK (
         status IN ('pending', 'active', 'revoked', 'expired')
