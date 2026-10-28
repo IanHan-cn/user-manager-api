@@ -114,13 +114,13 @@ func Test成员角色查询方法遇到零值标识不查库(t *testing.T) {
 				return r.GetByID(ctx, uuid.Nil())
 			},
 			"GetByMembershipAndRole 租户为零值": func() (*membershiprole.MembershipRole, error) {
-				return r.GetByMembershipAndRole(ctx, uuid.Nil(), uuid.New(), uuid.New())
+				return r.GetByMembershipAndRole(ctx, uuid.Nil(), uuid.New(), uuid.New(), time.Now())
 			},
 			"GetByMembershipAndRole 成员关系为零值": func() (*membershiprole.MembershipRole, error) {
-				return r.GetByMembershipAndRole(ctx, uuid.New(), uuid.Nil(), uuid.New())
+				return r.GetByMembershipAndRole(ctx, uuid.New(), uuid.Nil(), uuid.New(), time.Now())
 			},
 			"GetByMembershipAndRole 角色为零值": func() (*membershiprole.MembershipRole, error) {
-				return r.GetByMembershipAndRole(ctx, uuid.New(), uuid.New(), uuid.Nil())
+				return r.GetByMembershipAndRole(ctx, uuid.New(), uuid.New(), uuid.Nil(), time.Now())
 			},
 		}
 		for name, call := range cases {
@@ -142,7 +142,7 @@ func Test成员角色查询方法遇到零值标识不查库(t *testing.T) {
 				return r.ListByMembershipID(ctx, uuid.New(), uuid.Nil())
 			},
 			"ListActiveByMembershipID 租户为零值": func() ([]*membershiprole.MembershipRole, error) {
-				return r.ListActiveByMembershipID(ctx, uuid.Nil(), uuid.New())
+				return r.ListActiveByMembershipID(ctx, uuid.Nil(), uuid.New(), time.Now())
 			},
 			"ListByRoleID 角色为零值": func() ([]*membershiprole.MembershipRole, error) {
 				return r.ListByRoleID(ctx, uuid.New(), uuid.Nil())

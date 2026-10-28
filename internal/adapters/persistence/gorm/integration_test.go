@@ -679,7 +679,10 @@ func Test成员角色重复授权同一角色返回已存在且撤销后可重�
 	if err := f.memberRoles.Update(f.ctx, first); err != nil {
 		t.Fatalf("落库撤销失败：%v", err)
 	}
-	if got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID); got != nil || err != nil {
+	// 同一次业务判断里的多个查询用同一个 now：
+	// "能不能重新分配"与随后的写入必须按同一时刻判定。
+	now := time.Now()
+	if got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID, now); got != nil || err != nil {
 		t.Fatalf("撤销后不应再查到未失效的授权，实际 (%+v, %v)", got, err)
 	}
 
@@ -702,7 +705,7 @@ func Test成员角色重复授权同一角色返回已存在且撤销后可重�
 	}
 
 	// 当前生效的那条要能被单独取回。
-	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID)
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID, now)
 	if err != nil || got == nil || got.ID != second.ID {
 		t.Fatalf("应取回重新分配的那条，实际 (%+v, %v)", got, err)
 	}
@@ -763,7 +766,7 @@ func Test成员角色Update不得改到别的租户的行(t *testing.T) {
 	}
 
 	// 原行必须原样不动：仍在本租户、仍是 active。
-	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantA, membershipID, roleID)
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantA, membershipID, roleID, time.Now())
 	if err != nil || got == nil {
 		t.Fatalf("取回授权失败：%v", err)
 	}
@@ -844,7 +847,8 @@ func Test到期授权按到期先后被扫描且失效后不再重复出现(t *t
 	}
 
 	// 已到期的授权不再算作"未失效"。
-	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, mustParseUUID(t, dueLate.RoleID))
+	got, err := f.memberRoles.GetByMembershipAndRole(
+		f.ctx, tenantID, membershipID, mustParseUUID(t, dueLate.RoleID), time.Now())
 	if got != nil || err != nil {
 		t.Fatalf("到期后不应再查到未失效的授权，实际 (%+v, %v)", got, err)
 	}
@@ -927,5 +931,114 @@ func Test成员角色乐观锁版本号冲突(t *testing.T) {
 	err = f.memberRoles.Update(f.ctx, replicaA)
 	if !errors.Is(err, membershiprole.ErrMembershipRoleConflict) {
 		t.Fatalf("err = %v，期望触发并发冲突 ErrMembershipRoleConflict", err)
+	}
+}
+
+// Test已到期未推进的授权不参与鉴权也不挡住重新分配
+//
+// expired 只能由定时任务推进，而定时任务尚未落地：
+// 一条过了 expires_at 但状态仍是 active 的行，在库里与"仍然生效"无法区分。
+// 这一条锁住两个后果：
+//   - 鉴权侧不得把它算作生效（GetByMembershipAndRole 与 ListActiveByMembershipID
+//     都要排除它），否则就是一个真实的越权窗口；
+//   - 重新分配不得被它挡住：Create 必须先把它推进为 expired，
+//     否则它会一直占着部分唯一索引的槽位，让新分配撞 23505。
+func Test已到期未推进的授权不参与鉴权也不挡住重新分配(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+
+	// 先按未来到期建行，再用裸 SQL 把 effective_at / expires_at 一起挪到过去：
+	// 构造函数拒收过去的到期时间，而这里要的就是"已经到期但状态还没推进"的那一行。
+	// 仍然满足 expires_at > effective_at，不会撞 CHECK。
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Now().Add(time.Hour))
+	if err := f.raw.Exec(
+		"UPDATE membership_roles SET expires_at = now() - interval '1 hour',"+
+			" effective_at = now() - interval '2 hours' WHERE id = ?",
+		grant.ID,
+	).Error; err != nil {
+		t.Fatalf("把授权挪到过去失败：%v", err)
+	}
+
+	now := time.Now()
+
+	// 一、鉴权侧不得把它算作生效。
+	got, err := f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID, now)
+	if got != nil || err != nil {
+		t.Fatalf("已到期的授权不应被当作未失效，实际 (%+v, %v)", got, err)
+	}
+
+	active, err := f.memberRoles.ListActiveByMembershipID(f.ctx, tenantID, membershipID, now)
+	if err != nil {
+		t.Fatalf("查询生效授权失败：%v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("已到期的授权不应出现在生效列表里，实际 %d 条", len(active))
+	}
+
+	// 二、重新分配不能被它挡住：Create 先推进再插入。
+	regrant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, regrant); err != nil {
+		t.Fatalf("重新分配应先推进到期行再插入，实际 %v", err)
+	}
+
+	// 旧行必须被推进为 expired，而不是留在 active 上继续占着唯一槽位。
+	old, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	if err != nil || old == nil {
+		t.Fatalf("取回旧行失败：%v", err)
+	}
+	if old.Status != membershiprole.StatusExpired {
+		t.Fatalf("旧行应被推进为 expired，实际 %q", old.Status)
+	}
+	// 推进是一次真实的写：版本号必须反映出来，
+	// 否则持有旧副本的调用方会拿着同一个版本号覆盖掉这次推进。
+	if old.Version != grant.Version+1 {
+		t.Fatalf("推进后版本号 = %d，期望 %d", old.Version, grant.Version+1)
+	}
+
+	// 新行才是当前生效的那一条。
+	got, err = f.memberRoles.GetByMembershipAndRole(f.ctx, tenantID, membershipID, roleID, now)
+	if err != nil || got == nil || got.ID != regrant.ID {
+		t.Fatalf("应取回重新分配的那条，实际 (%+v, %v)", got, err)
+	}
+}
+
+// Test未到期的授权仍然占用唯一约束
+//
+// 这是上面那条的对照：写路径的"先推进"只针对真正过期的行。
+// 尚未到期的授权必须照旧挡住重复分配——
+// 否则"到期推进"就变成了"绕过唯一性"。
+func Test未到期的授权仍然占用唯一约束(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Now().Add(time.Hour))
+
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	if err := f.memberRoles.Create(f.ctx, dup); !errors.Is(err, membershiprole.ErrMembershipRoleExists) {
+		t.Fatalf("err = %v，期望 ErrMembershipRoleExists", err)
+	}
+
+	// 尚未到期的行不得被推进：它还是生效的授权。
+	still, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
+	if err != nil || still == nil {
+		t.Fatalf("取回授权失败：%v", err)
+	}
+	if still.Status != membershiprole.StatusActive {
+		t.Fatalf("尚未到期的授权不应被推进，实际状态 %q", still.Status)
+	}
+	if still.Version != grant.Version {
+		t.Fatalf("未被推进的行版本号不应变化：%d → %d", grant.Version, still.Version)
 	}
 }

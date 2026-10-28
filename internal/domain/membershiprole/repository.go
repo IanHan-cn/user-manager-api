@@ -25,6 +25,30 @@ import (
 //   - 所有写操作必须在事务内执行（ports.Transactor）：
 //     授权变更与 Casbin 策略投影要同批提交，避免回滚后留下半截状态。
 //
+// # 失效判定
+//
+// "尚未失效"是一个二维判定，缺一不可：
+//
+//	状态属于 pending / active，且尚未到期（expires_at 为 NULL 或晚于判定时刻）。
+//
+// 只看状态是不够的：expired 只能由定时任务经 ListDueForExpiry + Expire 推进，
+// 定时任务没跑到之前，一条已经过了 expires_at 的 active 行在库里仍然是 active。
+// 少了时间维度，两个后果同时成立：
+//   - 鉴权侧把一条早已过期的授权当成仍然生效，这是一个真实的越权窗口；
+//   - 重新分配被挡住：部分唯一索引 idx_membership_roles_membership_role_active
+//     的条件同样只看状态，一条过期未推进的 active 行会一直占着
+//     (membership_id, role_id) 的唯一槽位，新插一行撞 23505，
+//     运维侧看到的提示却是"该成员已持有该角色"，与事实正好相反。
+//
+// 因此约定：
+//   - 凡是回答"现在还算不算生效"的方法，实现方都必须带上时间条件；
+//   - 判定时刻 now 由调用方给出（与 ListDueForExpiry 同一口径）：
+//     同一次业务判断里的多个查询必须用同一个 now，
+//     否则两次判定会得出不同结论。
+//
+// 到期边界与领域层对齐：expires_at > now 才算尚未到期，
+// expires_at == now 即已到期（Expire 在 now == ExpiresAt 时是允许的）。
+//
 // # 租户隔离
 //
 // MembershipRole 是租户边界内的对象，因此：
@@ -47,6 +71,11 @@ import (
 // 那会抹掉上一次授权的存在痕迹（谁授的、何时失效、因何变更），
 // 也让"该成员曾经持有该角色"这件事变得无法追溯。
 //
+// "到期"这一侧还要多一步：一条已经过了 expires_at 但状态仍是 active 的行，
+// 在定时任务推进之前与"尚未失效"无法区分，它会一直占着唯一索引的槽位。
+// 因此实现方在 Create 插入新行之前，必须先把这批行推进为 expired
+// （见 Create 的注释），调用方不必自己先扫一遍。
+//
 // # 排序与分页
 //
 // 列表方法按 created_at 升序、created_at 相同时按 id 升序返回
@@ -61,6 +90,12 @@ type Repository interface {
 	// 已有一行 pending / active 的同角色授权）时返回 ErrMembershipRoleExists，
 	// 不得静默吞掉后返回 nil——那会让上层误以为授权已经生效。
 	// 传入空实体返回 ErrNilMembershipRole。
+	//
+	// 实现方必须先推进再插入：同一 (membership_id, role_id) 上"已经到期但状态
+	// 尚未推进"的授权行要先被推进为 expired，否则它会一直占着部分唯一索引的
+	// 槽位，让这次分配撞 23505（见类型注释的"失效判定"与"重新分配"小节）。
+	// 推进与插入必须在同一事务内完成：是否处于事务由调用方通过
+	// ports.Transactor 决定，实现方既不自行开事务，也不自行提交。
 	Create(ctx context.Context, r *MembershipRole) error
 
 	// Update 更新一条角色授权的可变字段。
@@ -90,6 +125,9 @@ type Repository interface {
 	// GetByMembershipAndRole 查询指定成员关系在指定角色上"尚未失效"的那条授权，
 	// 未命中返回 (nil, nil)。
 	//
+	// "尚未失效"按类型注释的"失效判定"小节执行：状态属于 pending / active，
+	// 且尚未到期（expires_at 为 NULL 或晚于 now）。
+	//
 	// 必须自带 status IN ('pending', 'active') 条件：
 	// 唯一性只对未失效的授权成立（见类型注释的"重新分配"小节），
 	// 同一对取值可能有若干历史行，少了该条件就会命中已失效的历史，
@@ -97,20 +135,31 @@ type Repository interface {
 	//
 	// 租户内的日常鉴权一律使用本方法而不是 GetByID：
 	// 它是唯一自带租户条件的单条查询，取回的结果不必再校验 TenantID。
-	GetByMembershipAndRole(ctx context.Context, tenantID, membershipID, roleID uuid.UUID) (*MembershipRole, error)
+	//
+	// now 是本次判定的时刻：同一次业务判断里的多个查询必须传同一个值。
+	GetByMembershipAndRole(
+		ctx context.Context, tenantID, membershipID, roleID uuid.UUID, now time.Time,
+	) (*MembershipRole, error)
 
 	// ListByMembershipID 查询指定成员关系的全部授权，含已撤销与已到期的历史行，
 	// 返回顺序见类型注释的"排序与分页"小节。
 	ListByMembershipID(ctx context.Context, tenantID, membershipID uuid.UUID) ([]*MembershipRole, error)
 
-	// ListActiveByMembershipID 查询指定成员关系当前生效的全部角色授权
-	// （status = active），返回顺序同上。
+	// ListActiveByMembershipID 查询指定成员关系当前生效的全部角色授权，
+	// 返回顺序见类型注释的"排序与分页"小节。
+	//
+	// "当前生效"按类型注释的"失效判定"小节执行：
+	// status = active，且尚未到期（expires_at 为 NULL 或晚于 now）。
+	// 少了时间维度，定时任务推进之前，已经过期的授权会继续出现在鉴权结果里。
 	//
 	// 与 ListByMembershipID 分开而不是让调用方自行过滤：
 	// "这个成员现在能用哪些角色"是鉴权热路径，
-	// 条件与索引 idx_membership_roles_tenant_membership 对齐、只回必要行，
 	// 不必每次都把历史行取回来再丢掉。
-	ListActiveByMembershipID(ctx context.Context, tenantID, membershipID uuid.UUID) ([]*MembershipRole, error)
+	//
+	// now 是本次判定的时刻：同一次业务判断里的多个查询必须传同一个值。
+	ListActiveByMembershipID(
+		ctx context.Context, tenantID, membershipID uuid.UUID, now time.Time,
+	) ([]*MembershipRole, error)
 
 	// ListByRoleID 查询指定角色被授予给哪些成员关系（含历史行），
 	// 返回顺序同上。

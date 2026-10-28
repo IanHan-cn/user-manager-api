@@ -38,7 +38,14 @@ import (
 //
 // pending 的语义是"待审批"，与 effective_at 无关：
 // 生效时间不参与等待，审批通过即生效。因此不存在"active 但尚未生效"的中间态，
-// 鉴权侧只需判定 status，不必再比对当前时间与 effective_at。
+// 鉴权侧不必再比对当前时间与 effective_at。
+//
+// 但"只看状态"只对 effective_at 成立，对 expires_at 不成立：
+// expired 只能由定时任务经 ListDueForExpiry + Expire 推进，
+// 任务没跑到之前，一条已经过了 expires_at 的 active 行在库里仍然是 active。
+// 因此"尚未失效"必须同时看两个维度——状态属于 pending / active，
+// 且尚未到期（expires_at 为空或晚于判定时刻）。
+// 这一判定由 Repository 的查询方法承担，见 repository.go 的"失效判定"小节。
 type Status string
 
 // 一次角色授权的全部状态取值。

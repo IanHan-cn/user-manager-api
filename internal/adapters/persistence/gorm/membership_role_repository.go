@@ -174,16 +174,68 @@ func translateMembershipRoleUpdateResult(result *gorm.DB, r *membershiprole.Memb
 // Create 写入一条角色授权，撞上 idx_membership_roles_membership_role_active
 // （该成员关系已有一行 pending / active 的同角色授权）时返回 ErrMembershipRoleExists。
 //
+// 插入前先推进：同一 (membership_id, role_id) 上"已经到期但状态尚未推进"的
+// 授权行会被推进为 expired（见 advanceExpiredDueGrants）。
+// 少了这一步，那批行会一直占着部分唯一索引的槽位，让这次分配撞 23505，
+// 而事实是那个角色早已到期——调用方看到的却是"该成员已持有该角色"。
+//
 // 错误怎么翻译见 translateMembershipRoleWriteError。
 func (r *MembershipRoleRepository) Create(ctx context.Context, m *membershiprole.MembershipRole) error {
 	if m == nil {
 		return membershiprole.ErrNilMembershipRole
 	}
 
-	rec := toMembershipRoleRecord(m)
 	db := dBFromContext(ctx, r.db)
+	// 推进与插入必须同处一个事务：事务由调用方通过 ports.Transactor 开启，
+	// 这里复用同一个句柄，不自行开事务也不自行提交。
+	if err := r.advanceExpiredDueGrants(ctx, db, m); err != nil {
+		return err
+	}
+
+	rec := toMembershipRoleRecord(m)
 	if err := db.WithContext(ctx).Create(&rec).Error; err != nil {
 		return translateMembershipRoleWriteError(err, m)
+	}
+	return nil
+}
+
+// advanceExpiredDueGrants 把同一 (tenant_id, membership_id, role_id) 上
+// "已经到期但状态尚未推进"的授权行推进为 expired。
+//
+// 为什么必须做这一步：部分唯一索引 idx_membership_roles_membership_role_active
+// 的条件是 status IN ('pending', 'active')，它看不到时间。
+// 定时任务把到期行推进为 expired 之前，一条过了 expires_at 的 active 行
+// 会一直占着 (membership_id, role_id) 的唯一槽位，于是"同一个角色重新分配"
+// 会撞 23505，被翻译成 ErrMembershipRoleExists——而事实是那个角色早已到期。
+// 部分索引的条件无法引用 now()（PostgreSQL 只接受不可变表达式），
+// 这一步因此只能在应用层做。
+//
+// 判定时刻取当前时间，不接受调用方传入的时间基准：
+// 推进的是"客观已经过期"的行，调用方若传一个将来的时刻，
+// 就会把别人仍在使用的授权提前作废。
+//
+// 只动 status 与 version 两列：
+//   - effective_at 不动：到期不改写生效时间（与领域层的 Expire 一致）；
+//   - reason 不动：到期不覆盖分配理由（与领域层的 Expire 一致）；
+//   - version 自增：这行确实被写过，版本号必须反映出来，
+//     否则持有旧副本的调用方会拿着同一个版本号覆盖掉这次推进；
+//   - updated_at 交给触发器（见 migrations/000009 的 trg_membership_roles_set_updated_at）。
+func (r *MembershipRoleRepository) advanceExpiredDueGrants(
+	ctx context.Context, db *gorm.DB, m *membershiprole.MembershipRole,
+) error {
+	result := db.WithContext(ctx).
+		Model(&membershipRoleRecord{}).
+		Where("tenant_id = ? AND membership_id = ? AND role_id = ?"+
+			" AND status IN ? AND expires_at IS NOT NULL AND expires_at <= ?",
+			m.TenantID, m.MembershipID, m.RoleID,
+			membershipRoleNotExpiredStatuses, time.Now()).
+		Select([]string{"status", "version"}).
+		Updates(map[string]any{
+			"status":  string(membershiprole.StatusExpired),
+			"version": gorm.Expr("version + 1"),
+		})
+	if result.Error != nil {
+		return translateMembershipRoleWriteError(result.Error, m)
 	}
 	return nil
 }
@@ -266,15 +318,25 @@ func (r *MembershipRoleRepository) GetByID(ctx context.Context, id uuid.UUID) (*
 // 状态条件与部分唯一索引 idx_membership_roles_membership_role_active 逐字一致
 // （取值见 membershipRoleNotExpiredStatuses）：
 // 少了它就会命中已撤销或已到期的历史行，让调用方误以为这个角色还不能被重新分配。
+//
+// 到期条件与状态条件缺一不可：expired 只能由定时任务推进，
+// 定时任务没跑到之前，一条已经过了 expires_at 的 active 行在库里仍是 active。
+// 只按状态过滤会同时造成两个后果——鉴权侧把它当成仍然生效（越权窗口），
+// 以及重新分配被它挡住（撞唯一索引后被误报成"该成员已持有该角色"）。
+//
+// 边界与领域层的 Expire 对齐：expires_at > now 才算尚未到期，
+// expires_at == now 即已到期（Expire 在 now == ExpiresAt 时是允许的）。
 func (r *MembershipRoleRepository) GetByMembershipAndRole(
-	ctx context.Context, tenantID, membershipID, roleID uuid.UUID,
+	ctx context.Context, tenantID, membershipID, roleID uuid.UUID, now time.Time,
 ) (*membershiprole.MembershipRole, error) {
 	if tenantID == uuid.Nil() || membershipID == uuid.Nil() || roleID == uuid.Nil() {
 		return nil, nil
 	}
 	return r.findOne(ctx,
-		"tenant_id = ? AND membership_id = ? AND role_id = ? AND status IN ?",
-		tenantID.String(), membershipID.String(), roleID.String(), membershipRoleNotExpiredStatuses)
+		"tenant_id = ? AND membership_id = ? AND role_id = ? AND status IN ?"+
+			" AND (expires_at IS NULL OR expires_at > ?)",
+		tenantID.String(), membershipID.String(), roleID.String(),
+		membershipRoleNotExpiredStatuses, now)
 }
 
 // findOne 按条件取一条授权，未命中返回 (nil, nil)。
@@ -310,18 +372,22 @@ func (r *MembershipRoleRepository) ListByMembershipID(
 // ListActiveByMembershipID 查询指定成员关系当前生效的角色授权，
 // 按 created_at、id 升序。
 //
-// 条件与 ListByMembershipID 只差一个 status：该列不在索引前缀里，
+// "当前生效"要同时满足 status = active 与尚未到期：
+// 只按状态过滤的话，定时任务推进之前，已经过期的授权会继续出现在鉴权结果里。
+//
+// 条件与 ListByMembershipID 只差 status 与到期判定：这两列都不在索引前缀里，
 // 因此这次扫描会在索引命中后回表过滤，代价可接受——
 // 一个成员持有的角色数是十以内的量级。
 func (r *MembershipRoleRepository) ListActiveByMembershipID(
-	ctx context.Context, tenantID, membershipID uuid.UUID,
+	ctx context.Context, tenantID, membershipID uuid.UUID, now time.Time,
 ) ([]*membershiprole.MembershipRole, error) {
 	if tenantID == uuid.Nil() || membershipID == uuid.Nil() {
 		return []*membershiprole.MembershipRole{}, nil
 	}
 	return r.listBy(ctx,
-		"tenant_id = ? AND membership_id = ? AND status = ?",
-		tenantID.String(), membershipID.String(), membershiprole.StatusActive)
+		"tenant_id = ? AND membership_id = ? AND status = ?"+
+			" AND (expires_at IS NULL OR expires_at > ?)",
+		tenantID.String(), membershipID.String(), membershiprole.StatusActive, now)
 }
 
 // ListByRoleID 查询指定角色被授予给哪些成员关系（含历史行），

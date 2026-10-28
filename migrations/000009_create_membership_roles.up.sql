@@ -99,11 +99,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_membership_roles_membership_role_active
     WHERE status IN ('pending', 'active');
 
 -- 支撑 ListByMembershipID / ListActiveByMembershipID / GetByMembershipAndRole：
--- 三者都以 (tenant_id, membership_id) 等值过滤，排序为 created_at、id 升序
--- （顺序口径见 Repository 端口注释的"排序与分页"小节）。
+-- 三者都以 (tenant_id, membership_id) 等值过滤。
 --
--- 列顺序刻意与排序键一致（tenant_id, membership_id 等值过滤 + created_at, id 排序），
--- 使该扫描直接走索引顺序，无需额外排序步骤。
+-- ListByMembershipID 与 ListActiveByMembershipID 的排序为 created_at、id 升序
+-- （顺序口径见 Repository 端口注释的"排序与分页"小节），
+-- 与本索引的列顺序一致，扫描直接走索引顺序，无需额外排序步骤。
+--
+-- ListActiveByMembershipID 还要按 status 与到期条件回表过滤，
+-- GetByMembershipAndRole 还要按 role_id 回表过滤：
+-- 这两列都不在索引前缀里。一个成员持有的角色数是十以内的量级，代价可接受。
 --
 -- 原设计里那条单独的 membership_id 索引不再单建：
 -- 本仓所有查询都带 tenant_id 条件，本索引的前缀已覆盖"按成员关系取授权"，
