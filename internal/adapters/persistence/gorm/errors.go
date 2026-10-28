@@ -1,6 +1,6 @@
 package gorm
 
-// 本文件放四个仓储共用的写操作结局判定。
+// 本文件放五个仓储共用的写操作结局判定。
 //
 // 此前 user / role / tenant / membership 各有一份逐字相同的 switch：
 // ErrDuplicatedKey → 聚合自己的"已存在"错误，ErrCheckConstraintViolated →
@@ -8,6 +8,10 @@ package gorm
 // 两个 sentinel 与两句定位文案，把这个差异抽成 writeTargets，
 // 结构只在 classifyWriteError 里留一份。
 // Update 的 RowsAffected == 0 判定同理，见 classifyUpdateResult。
+//
+// 后者目前服务 membership、tenant、user 三个仓储：
+// 成员角色授权的 Update 额外带版本号前提，命中 0 行时要区分
+// "记录不存在"与"已被他人改过"，因此走的是自己的判定。
 //
 // 除去重之外，顺带把"哪些错误会被翻译、各自归到哪一类"收成一处：
 // 以后要认第三种结局，改这里就够了，不必挨个仓储去找。

@@ -1,4 +1,3 @@
-// internal/ports/policy.go
 package ports
 
 import "context"

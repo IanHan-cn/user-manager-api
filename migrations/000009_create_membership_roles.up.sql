@@ -1,4 +1,3 @@
--- migrations/000009_create_membership_roles.up.sql
 -- 成员角色授权关联表，对应 domain/membershiprole.MembershipRole。
 --
 -- 一条记录刻画"某成员关系在某租户中被授予某个角色"这一次授权：

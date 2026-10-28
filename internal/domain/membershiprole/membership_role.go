@@ -1,4 +1,3 @@
-// interval/domain/membershiprole/membership_role.go
 // Package membershiprole 定义成员关系与角色之间的授权关联实体、状态机与持久化端口。
 //
 // 分层约束：本包属于 Domain，不得依赖 Gin、GORM、Redis 或 Casbin。

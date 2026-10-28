@@ -1,4 +1,3 @@
-// Package middleware 存放与传输层相关但与业务无关的 Gin 中间件。
 package middleware
 
 import (

@@ -1,3 +1,7 @@
+// Command api 装配并启动用户管理 API 服务。
+//
+// 进程内不执行数据库迁移：迁移由独立的 migrate 命令负责，服务启动只校验迁移状态。
+// 同一二进制也提供 -healthcheck 子命令，供容器探针请求本地就绪检查端点。
 package main
 
 import (

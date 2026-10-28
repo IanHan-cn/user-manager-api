@@ -1,4 +1,3 @@
-// internal/adapters/persistence/gorm/membership_role_repository.go
 package gorm
 
 import (
@@ -161,16 +160,6 @@ func translateMembershipRoleWriteError(err error, r *membershiprole.MembershipRo
 	return classifyWriteError(err, membershipRoleWriteTargets(r))
 }
 
-// translateMembershipRoleUpdateResult 判定 Update 的执行结果：出错翻译成领域错误，
-// 没改到任何行返回 ErrMembershipRoleNotFound。两条判定见 classifyUpdateResult。
-func translateMembershipRoleUpdateResult(result *gorm.DB, r *membershiprole.MembershipRole) error {
-	return classifyUpdateResult(result, updateTargets{
-		write:    membershipRoleWriteTargets(r),
-		notFound: membershiprole.ErrMembershipRoleNotFound,
-		identity: fmt.Sprintf("id=%s", r.ID),
-	})
-}
-
 // Create 写入一条角色授权，撞上 idx_membership_roles_membership_role_active
 // （该成员关系已有一行 pending / active 的同角色授权）时返回 ErrMembershipRoleExists。
 //
@@ -240,14 +229,21 @@ func (r *MembershipRoleRepository) advanceExpiredDueGrants(
 	return nil
 }
 
-// Update 更新一条角色授权的可变字段，记录不存在时返回 ErrMembershipRoleNotFound。
+// Update 更新一条角色授权的可变字段，记录不存在时返回 ErrMembershipRoleNotFound，
+// 版本号对不上时返回 ErrMembershipRoleConflict。
 //
 // 条件里刻意带上 tenant_id：授权是租户边界内的对象，
 // 只按主键更新时，一条来自别处（或被串改）的 id 就能改到别的租户的行。
 // 这也是端口"任何写入都必须以 tenant_id 为条件"的落地。
 //
+// version 是乐观锁令牌：WHERE 带上调用方读到的版本号，
+// 命中 0 行时区分"记录不存在"与"已被他人改过"，
+// 后者必须报错而不是静默覆盖。
+//
+// 成功后会把传入实体的 Version 自增：调用方拿着同一份实体继续更新即可，
+// 不必先重新查询（重新查询能额外拿到最新的 updated_at）。
+//
 // 只写 membershipRoleUpdatableColumns 列出的列，updated_at 由触发器维护，本方法不写。
-// Update 更新一条角色授权的可变字段，加入乐观锁与并发冲突检测。
 func (r *MembershipRoleRepository) Update(ctx context.Context, m *membershiprole.MembershipRole) error {
 	if m == nil {
 		return membershiprole.ErrNilMembershipRole
@@ -275,7 +271,7 @@ func (r *MembershipRoleRepository) Update(ctx context.Context, m *membershiprole
 		return translateMembershipRoleWriteError(result.Error, m)
 	}
 
-	// 影响行数为 0 时，判定是“数据不存在（404）”还是“并发冲突被修改（409）”
+	// 影响行数为 0 时，判定是"数据不存在（404）"还是"并发冲突被修改（409）"
 	if result.RowsAffected == 0 {
 		var existing membershipRoleRecord
 		err := db.WithContext(ctx).
@@ -284,19 +280,37 @@ func (r *MembershipRoleRepository) Update(ctx context.Context, m *membershiprole
 			Take(&existing).Error
 
 		if err != nil {
-			if isRecordNotFound(err) {
-				return fmt.Errorf("%w: id=%s", membershiprole.ErrMembershipRoleNotFound, m.ID)
+			if !isRecordNotFound(err) {
+				return fmt.Errorf("检查成员角色授权是否存在失败：%w", err)
 			}
-			return fmt.Errorf("检查成员角色授权是否存在失败：%w", err)
+			return classifyMembershipRoleUpdate(false, m.ID)
 		}
 
 		// 记录存在，但 version 对不上 -> 说明被其他人并发修改过
-		return membershiprole.ErrMembershipRoleConflict
+		return classifyMembershipRoleUpdate(true, m.ID)
 	}
 
 	// 更新成功后，同步自增内存实体的版本号，方便后续连续调用
 	m.Version++
 	return nil
+}
+
+// classifyMembershipRoleUpdate 判定 Update 命中 0 行时的结局。
+//
+// 命中 0 行说明更新没有落到任何行，原因只有两种：
+//   - 目标行压根不存在（exists 为 false）：调用方要改的东西不在库里；
+//   - 目标行存在但版本号对不上（exists 为 true）：这行已被他人改过。
+//
+// 两种情形的处置完全不同：前者是调用方 bug（404），
+// 后者要让调用方重新读取后再决定（409），绝不能静默覆盖。
+//
+// 单独成函数是为了让它能脱离数据库验证：命中 0 行之后的分支
+// 在集成测试里要靠 Docker 才能跑到。
+func classifyMembershipRoleUpdate(exists bool, id string) error {
+	if exists {
+		return membershiprole.ErrMembershipRoleConflict
+	}
+	return fmt.Errorf("%w: id=%s", membershiprole.ErrMembershipRoleNotFound, id)
 }
 
 // GetByID 按主键查询授权，未命中返回 (nil, nil)。

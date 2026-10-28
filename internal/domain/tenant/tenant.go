@@ -1,3 +1,4 @@
+// Package tenant 定义租户实体、租户状态、构造规则与持久化端口。
 package tenant
 
 import (

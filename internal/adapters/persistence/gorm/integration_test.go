@@ -1,4 +1,3 @@
-// internal/adapters/persistence/gorm/integration_test.go
 package gorm
 
 // 本文件对本包的 SQL 做端到端校验：起一个真实的 Postgres 容器，
@@ -39,6 +38,7 @@ import (
 	// 注册 PostgreSQL 数据库驱动，缺失会报 "database driver unknown"。
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/memories-cn/user-management-api/internal/domain"
 	"github.com/memories-cn/user-management-api/internal/domain/membership"
 	"github.com/memories-cn/user-management-api/internal/domain/membershiprole"
 	"github.com/memories-cn/user-management-api/internal/domain/permission"
@@ -1040,5 +1040,31 @@ func Test未到期的授权仍然占用唯一约束(t *testing.T) {
 	}
 	if still.Version != grant.Version {
 		t.Fatalf("未被推进的行版本号不应变化：%d → %d", grant.Version, still.Version)
+	}
+}
+
+// Test成员角色Update不存在的行返回记录不存在
+//
+// 乐观锁改造之后，Update 的 WHERE 里多了一个 version 前提，
+// 命中 0 行时必须区分"记录不存在"与"已被他人改过"：
+// 否则一次针对不存在行的更新会被误报成并发冲突（409），
+// 上层会把它当成"再读一次就好"，而真相是这条记录从来就不存在。
+func Test成员角色Update不存在的行返回记录不存在(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+	grant := f.mustGrantRole(t, tenantID, membershipID, roleID, time.Time{})
+
+	// 把主键换成一个不存在的 id：更新命中 0 行，存在性复查也查不到。
+	grant.ID = uuid.NewV7().String()
+
+	err := f.memberRoles.Update(f.ctx, grant)
+	if !errors.Is(err, membershiprole.ErrMembershipRoleNotFound) {
+		t.Fatalf("err = %v，期望 ErrMembershipRoleNotFound", err)
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v，应归类到 domain.ErrNotFound", err)
 	}
 }

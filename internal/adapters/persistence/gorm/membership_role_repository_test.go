@@ -293,28 +293,36 @@ func Test成员角色遇到未识别的数据库错误原样上抛(t *testing.T)
 	}
 }
 
-// Test成员角色Update结果判定的三条分支
-func Test成员角色Update结果判定的三条分支(t *testing.T) {
-	r := newTestMembershipRole(t)
+// Test成员角色Update命中零行时的两种结局
+//
+// Update 的 WHERE 带着版本号前提，命中 0 行有两种原因：
+// 目标行不存在（调用方 bug，404），或目标行已被他人改过（409）。
+// 这条判定必须能脱离数据库单独验证——命中 0 行之后的分支
+// 在集成测试里要靠 Docker 才能跑到。
+func Test成员角色Update命中零行时的两种结局(t *testing.T) {
+	t.Run("目标行不存在", func(t *testing.T) {
+		err := classifyMembershipRoleUpdate(false, "some-id")
+		if !errors.Is(err, membershiprole.ErrMembershipRoleNotFound) {
+			t.Fatalf("err = %v，期望 ErrMembershipRoleNotFound", err)
+		}
+		if !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("err = %v，应归类到 domain.ErrNotFound", err)
+		}
+	})
 
-	if err := translateMembershipRoleUpdateResult(&gorm.DB{RowsAffected: 1}, r); err != nil {
-		t.Fatalf("改到一行时应返回 nil，实际 %v", err)
-	}
-
-	// 没改到任何行即目标不存在：静默成功会让上层误以为更新生效。
-	err := translateMembershipRoleUpdateResult(&gorm.DB{RowsAffected: 0}, r)
-	if !errors.Is(err, membershiprole.ErrMembershipRoleNotFound) {
-		t.Fatalf("err = %v，期望 ErrMembershipRoleNotFound", err)
-	}
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("err = %v，应归类到 domain.ErrNotFound", err)
-	}
-
-	// 出错时走同一套翻译，不得绕过。
-	err = translateMembershipRoleUpdateResult(&gorm.DB{Error: gorm.ErrDuplicatedKey}, r)
-	if !errors.Is(err, membershiprole.ErrMembershipRoleExists) {
-		t.Fatalf("err = %v，期望 ErrMembershipRoleExists", err)
-	}
+	t.Run("目标行已被他人改过", func(t *testing.T) {
+		err := classifyMembershipRoleUpdate(true, "some-id")
+		if !errors.Is(err, membershiprole.ErrMembershipRoleConflict) {
+			t.Fatalf("err = %v，期望 ErrMembershipRoleConflict", err)
+		}
+		if !errors.Is(err, domain.ErrConflict) {
+			t.Fatalf("err = %v，应归类到 domain.ErrConflict", err)
+		}
+		// 冲突与不存在必须能区分：前者让调用方重新读取，后者是调用方 bug。
+		if errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("err = %v，不应归类到 domain.ErrNotFound", err)
+		}
+	})
 }
 
 // Test成员角色可写列白名单排除业务键与授权动作

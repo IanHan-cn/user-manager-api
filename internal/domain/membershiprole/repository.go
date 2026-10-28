@@ -105,7 +105,14 @@ type Repository interface {
 	// 前四者是一次授权的业务键与归属，换了其中任何一个就已是另一次授权，
 	// 而不是"改了一下"；assigned_by / assigned_at 记录授权动作本身，不可覆写，
 	// 否则"谁授的权"会被事后改写；created_at 不可变，updated_at 归触发器维护。
-	// 真正会被写入的只有 status、reason、effective_at、expires_at 四项。
+	// 真正会被写入的只有 status、reason、effective_at、expires_at、version 五项：
+	// version 是乐观锁令牌，实现方在更新成功时自增它。
+	//
+	// 乐观锁：实现方必须以调用方读到的 version 作为更新前提。
+	// 前提对不上说明这行已被他人改过，必须返回 ErrMembershipRoleConflict，
+	// 不得静默覆盖——那会把一次撤销无声地回滚掉。
+	// 实现方负责在更新成功后把调用方实体的 version 自增，
+	// 调用方据此可以对同一行发起下一次更新，不必先重新查询。
 	//
 	// 更新必须以 tenant_id 为条件（见类型注释的"租户隔离"小节）：
 	// 传入的授权归属与库中不一致时按未命中处理，

@@ -1,4 +1,3 @@
-// internal/adapters/persistence/gorm/user_repository.go
 package gorm
 
 import (
