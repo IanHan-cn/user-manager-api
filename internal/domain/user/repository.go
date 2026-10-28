@@ -1,4 +1,3 @@
-// internal/domain/user/repository.go
 package user
 
 import (

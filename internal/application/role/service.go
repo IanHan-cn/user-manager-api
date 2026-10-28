@@ -1,3 +1,4 @@
+// Package role 承载角色相关用例的骨架：当前只有服务结构与构造，方法尚未落地。
 package role
 
 import (

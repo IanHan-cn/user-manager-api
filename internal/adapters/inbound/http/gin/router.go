@@ -1,3 +1,4 @@
+// Package gin 装配 Gin 传输层：路由表与依赖注入。
 package gin
 
 import (

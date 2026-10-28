@@ -1,3 +1,4 @@
+// Package platformsetup 为租户预置系统角色与默认权限矩阵。
 package platformsetup
 
 import (

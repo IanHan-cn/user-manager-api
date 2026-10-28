@@ -1,4 +1,3 @@
-// internal/ports/transactor.go
 package ports
 
 import "context"

@@ -1,4 +1,5 @@
-// internal/application/user/service.go
+// Package user 承载用户相关用例的骨架：当前只装配 Repository 与 Transactor，
+// 用例方法尚未落地。
 package user
 
 import (

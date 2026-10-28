@@ -1,4 +1,3 @@
-// internal/domain/role/repository.go
 package role
 
 import (

@@ -1,4 +1,3 @@
-// internal/domain/tenant/repository.go
 package tenant
 
 import (

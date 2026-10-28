@@ -1,4 +1,3 @@
-// internal/domain/permission/repository.go
 package permission
 
 import (

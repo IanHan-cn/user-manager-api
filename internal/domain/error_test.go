@@ -22,23 +22,25 @@ import (
 // Test字段类错误统一归入 ErrInvalidKey
 func Test字段类错误统一归入ErrInvalidKey(t *testing.T) {
 	cases := map[string]error{
-		"domain.ErrInvalidTenantID":    domain.ErrInvalidTenantID,
-		"domain.ErrInvalidUserID":      domain.ErrInvalidUserID,
-		"domain.ErrInvalidActor":       domain.ErrInvalidActor,
-		"domain.ErrInvalidPlanCode":    domain.ErrInvalidPlanCode,
-		"domain.ErrInvalidSlug":        domain.ErrInvalidSlug,
-		"domain.ErrInvalidName":        domain.ErrInvalidName,
-		"role.ErrInvalidRoleKey":       role.ErrInvalidRoleKey,
-		"role.ErrNotSystemKey":         role.ErrNotSystemKey,
-		"role.ErrReservedSystemKey":    role.ErrReservedSystemKey,
-		"user.ErrInvalidZitadelUserID": user.ErrInvalidZitadelUserID,
-		"user.ErrInvalidUsername":      user.ErrInvalidUsername,
-		"user.ErrInvalidEmail":         user.ErrInvalidEmail,
-		"user.ErrInvalidPhone":         user.ErrInvalidPhone,
-		"user.ErrInvalidAvatarURL":     user.ErrInvalidAvatarURL,
-		"user.ErrInvalidUserStatus":    user.ErrInvalidUserStatus,
-		"user.ErrInvalidUserRecord":    user.ErrInvalidUserRecord,
-		"permission.ErrInvalidCode":    permission.ErrInvalidCode,
+		"domain.ErrInvalidTenantID":     domain.ErrInvalidTenantID,
+		"domain.ErrInvalidUserID":       domain.ErrInvalidUserID,
+		"domain.ErrInvalidActor":        domain.ErrInvalidActor,
+		"domain.ErrInvalidPlanCode":     domain.ErrInvalidPlanCode,
+		"domain.ErrInvalidSlug":         domain.ErrInvalidSlug,
+		"domain.ErrInvalidName":         domain.ErrInvalidName,
+		"role.ErrInvalidRoleKey":        role.ErrInvalidRoleKey,
+		"role.ErrNotSystemKey":          role.ErrNotSystemKey,
+		"role.ErrReservedSystemKey":     role.ErrReservedSystemKey,
+		"user.ErrInvalidZitadelUserID":  user.ErrInvalidZitadelUserID,
+		"user.ErrInvalidUsername":       user.ErrInvalidUsername,
+		"user.ErrInvalidEmail":          user.ErrInvalidEmail,
+		"user.ErrInvalidPhone":          user.ErrInvalidPhone,
+		"user.ErrInvalidAvatarURL":      user.ErrInvalidAvatarURL,
+		"user.ErrInvalidUserStatus":     user.ErrInvalidUserStatus,
+		"user.ErrInvalidUserRecord":     user.ErrInvalidUserRecord,
+		"permission.ErrInvalidCode":     permission.ErrInvalidCode,
+		"domain.ErrInvalidMembershipID": domain.ErrInvalidMembershipID,
+		"domain.ErrInvalidLimit":        domain.ErrInvalidLimit,
 	}
 
 	for name, err := range cases {
@@ -172,6 +174,51 @@ func Test空实体错误不混入业务分类(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Test主键重复错误不混入业务分类
+//
+// 主键重复是写入本身的缺陷（ID 生成或重试逻辑的问题），
+// 不是调用方换个业务键就能解决的正常冲突。
+// 它与 ErrNilEntity 同理：不挂业务分类树，HTTP 层应映射为 500。
+//
+// 它同时必须与各聚合的"已存在"错误区分开：
+// 后者说的是业务键重复，前者说的是主键撞了。
+func Test主键重复错误不混入业务分类(t *testing.T) {
+	if !errors.Is(domain.ErrDuplicateID, domain.ErrDataIntegrity) {
+		t.Fatal("domain.ErrDuplicateID 未归类到 domain.ErrDataIntegrity")
+	}
+
+	business := map[string]error{
+		"ErrInvalidKey":    domain.ErrInvalidKey,
+		"ErrInvalidState":  domain.ErrInvalidState,
+		"ErrConflict":      domain.ErrConflict,
+		"ErrNotFound":      domain.ErrNotFound,
+		"ErrAlreadyExists": domain.ErrAlreadyExists,
+	}
+	for name, base := range business {
+		t.Run(name, func(t *testing.T) {
+			if errors.Is(domain.ErrDuplicateID, base) {
+				t.Fatalf("主键重复不应归类到 %s", name)
+			}
+		})
+	}
+
+	// 与各聚合的"已存在"错误必须互相可辨。
+	if errors.Is(membership.ErrMembershipExists, domain.ErrDuplicateID) {
+		t.Fatal("成员关系已存在不应被误判为主键重复")
+	}
+	if errors.Is(domain.ErrDuplicateID, membership.ErrMembershipExists) {
+		t.Fatal("主键重复不应被误判为成员关系已存在")
+	}
+
+	// ErrDataIntegrity 本身是"不混入业务分类"的那一层：
+	// 它若挂到了某个业务基类上，主键重复就会重新变成一个 4xx。
+	for name, base := range business {
+		if errors.Is(domain.ErrDataIntegrity, base) {
+			t.Fatalf("数据完整性基类不应归类到 %s", name)
+		}
 	}
 }
 

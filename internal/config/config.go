@@ -1,3 +1,4 @@
+// Package config 读取并校验进程配置：环境变量、分段配置与日志级别。
 package config
 
 import (
