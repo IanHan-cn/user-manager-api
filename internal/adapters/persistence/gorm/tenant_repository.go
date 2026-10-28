@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/memories-cn/user-management-api/internal/domain"
 	"github.com/memories-cn/user-management-api/internal/domain/tenant"
 	"gorm.io/gorm"
 )
@@ -144,6 +145,18 @@ func tenantWriteTargets(t *tenant.Tenant) writeTargets {
 		conflictIdentity: fmt.Sprintf("slug=%s", t.Slug),
 		invalid:          tenant.ErrInvalidTenantRecord,
 		invalidIdentity:  fmt.Sprintf("id=%s", t.ID),
+		byConstraint: map[string]constraintOutcome{
+			// 主键重复是写入本身的缺陷，与"租户已存在"无关。
+			"tenants_pkey": {
+				err:      domain.ErrDuplicateID,
+				identity: fmt.Sprintf("id=%s", t.ID),
+			},
+			// 业务唯一索引：同一租户下 slug 唯一。
+			"idx_tenants_slug_active": {
+				err:      tenant.ErrTenantExists,
+				identity: fmt.Sprintf("slug=%s", t.Slug),
+			},
+		},
 	}
 }
 

@@ -121,7 +121,7 @@ func requireUUID(value string, invalid error) (string, error) {
 // 调用方据此返回空结果而不是错误。
 //
 // 非空但非法的标识是另一种情况：那是调用方 bug
-//（把租户 ID 当成角色 ID 传进来，或者 UUID 拼错了），
+// （把租户 ID 当成角色 ID 传进来，或者 UUID 拼错了），
 // 静默当成"查不到"会把一次程序缺陷伪装成正常的业务结果，
 // 因此这里返回错误，与写路径 requireUUID 的口径一致。
 //
@@ -147,6 +147,18 @@ func roleWriteTargets(role *domainrole.Role) writeTargets {
 		conflictIdentity: fmt.Sprintf("tenant_id=%s key=%s", role.TenantID, role.Key),
 		invalid:          domainrole.ErrInvalidRoleKey,
 		invalidIdentity:  fmt.Sprintf("key=%s", role.Key),
+		byConstraint: map[string]constraintOutcome{
+			// 主键重复是写入本身的缺陷，与"角色已存在"无关。
+			"roles_pkey": {
+				err:      domain.ErrDuplicateID,
+				identity: fmt.Sprintf("id=%s", role.ID),
+			},
+			// 业务唯一索引：同一租户下角色 key 唯一。
+			"idx_roles_tenant_key": {
+				err:      domainrole.ErrRoleExists,
+				identity: fmt.Sprintf("tenant_id=%s key=%s", role.TenantID, role.Key),
+			},
+		},
 	}
 }
 

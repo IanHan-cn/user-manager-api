@@ -7,6 +7,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/memories-cn/user-management-api/internal/domain"
 	"github.com/memories-cn/user-management-api/internal/domain/membershiprole"
 	"gorm.io/gorm"
 )
@@ -120,10 +121,11 @@ func (r membershipRoleRecord) toEntity() *membershiprole.MembershipRole {
 	}
 }
 
-// toUpdateMap 给出 Update 的列值对，键集合必须与 membershipRoleUpdatableColumns 一致。
+// toUpdateMap 返回用于更新的列值映射，键集合必须与 membershipRoleUpdatableColumns 一致。
 //
-// 用 map 而不是结构体：按结构体更新时零值字段会被 GORM 跳过，
-// 而"清空 reason"（撤销时没写理由之外的情形）正是要把一个列写成 NULL。
+// 使用 map[string]any 而非结构体的原因：
+// 当使用结构体进行 Updates 更新时，GORM 会默认跳过零值字段；
+// 而通过 map 可以确保所有字段（包括需要显式清空为 NULL 的可选字段，如 expires_at）都能被正确更新到数据库中。
 func (r membershipRoleRecord) toUpdateMap() map[string]any {
 	return map[string]any{
 		"status":       r.Status,
@@ -150,6 +152,45 @@ func membershipRoleWriteTargets(r *membershiprole.MembershipRole) writeTargets {
 		conflictIdentity: fmt.Sprintf("membership_id=%s role_id=%s", r.MembershipID, r.RoleID),
 		invalid:          membershiprole.ErrInvalidMembershipRoleRecord,
 		invalidIdentity:  fmt.Sprintf("id=%s status=%s", r.ID, r.Status),
+		byConstraint: map[string]constraintOutcome{
+			// 主键重复是写入本身的缺陷，与"已持有该角色"无关：
+			// 混为一谈会让排障去找业务键，而真正该查的是 ID。
+			"membership_roles_pkey": {
+				err:      domain.ErrDuplicateID,
+				identity: fmt.Sprintf("id=%s", r.ID),
+			},
+			// 业务唯一索引：同一成员关系对同一角色只能有一行未失效的授权。
+			"idx_membership_roles_membership_role_active": {
+				err:      membershiprole.ErrMembershipRoleExists,
+				identity: fmt.Sprintf("membership_id=%s role_id=%s", r.MembershipID, r.RoleID),
+			},
+			// 字段级 CHECK：与领域层的同名字段错误同一口径。
+			// 不分流的话，同一个非法取值从领域层进来是 400，
+			// 从数据库层进来却是 409——同一语义两个状态码。
+			"chk_membership_roles_reason": {
+				err:      membershiprole.ErrInvalidReason,
+				identity: "reason",
+			},
+			"chk_membership_roles_expires_after_effective": {
+				err:      membershiprole.ErrInvalidEffectiveRange,
+				identity: fmt.Sprintf("expires_at=%v effective_at=%v", r.ExpiresAt, r.EffectiveAt),
+			},
+			"chk_membership_roles_assigned_by_not_blank": {
+				err:      domain.ErrInvalidActor,
+				identity: fmt.Sprintf("assigned_by=%s", r.AssignedBy),
+			},
+			// 下面两条领域层没有同口径的字段级错误：
+			// status 取值域与"expired 必须带到期时间"都只在绕过领域层时才会触发，
+			// 它们是两侧口径漂移的信号，仍归记录级错误。
+			"chk_membership_roles_status": {
+				err:      membershiprole.ErrInvalidMembershipRoleRecord,
+				identity: fmt.Sprintf("id=%s status=%s", r.ID, r.Status),
+			},
+			"chk_membership_roles_expired_has_expires_at": {
+				err:      membershiprole.ErrInvalidMembershipRoleRecord,
+				identity: fmt.Sprintf("id=%s status=%s", r.ID, r.Status),
+			},
+		},
 	}
 }
 

@@ -66,7 +66,7 @@ const maxReasonLen = 512
 // 它让租户条件下推到本表的索引，代价是与 memberships.tenant_id 没有外键兜底，
 // 一致性由"所有写入都经过本包的构造函数与 Repository"保证。
 //
-// 四个业务时间戳各司其职，不得互相代替：
+// 三个业务时间戳+一个行级时间戳各司其职，不得互相代替：
 //   - AssignedAt：授权动作发生的时间，恒非空；
 //   - EffectiveAt：开始生效的时间，恒非空；
 //   - ExpiresAt：失效时间，零值表示长期有效；
@@ -278,7 +278,7 @@ func newMembershipRole(
 // 而分配理由允许留空（分配本身由 assigned_by / assigned_at 追溯）。
 //
 // 去空白而不只是判空串：纯空白的原因落到库里会撞上
-// chk_membership_roles_reason（btrim(reason) <> ”），
+// chk_membership_roles_reason（btrim(reason) <> ''），
 // 与其等着撞约束，不如在入口就当成"没填"。
 //
 // 上限按字符数（rune）计而不是字节数：数据库的 length(reason) 数的是字符，

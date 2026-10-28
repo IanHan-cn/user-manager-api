@@ -3,7 +3,6 @@ package gorm
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 	"uuid"
@@ -238,10 +237,12 @@ func Test成员角色长期有效与未填原因落库为NULL(t *testing.T) {
 // 端口要求"撞上 idx_membership_roles_membership_role_active 必须返回
 // ErrMembershipRoleExists，不得静默吞掉后返回 nil"：
 // 授权流程正是靠它区分"已经持有该角色"与"授权已生效"。
+//
+// 错误按生产环境的样子构造：GORM 的翻译把驱动错误包在错误链的第二个位置上，
+// 约束名只能靠 errors.As 取（见 classifyWriteError）。
 func Test部分唯一索引冲突归入ErrMembershipRoleExists(t *testing.T) {
 	r := newTestMembershipRole(t)
-	err := fmt.Errorf("duplicate key value violates unique constraint %q: %w",
-		"idx_membership_roles_membership_role_active", gorm.ErrDuplicatedKey)
+	err := pgConstraintError("23505", "idx_membership_roles_membership_role_active", gorm.ErrDuplicatedKey)
 
 	got := translateMembershipRoleWriteError(err, r)
 	if !errors.Is(got, membershiprole.ErrMembershipRoleExists) {
@@ -261,13 +262,15 @@ func Test部分唯一索引冲突归入ErrMembershipRoleExists(t *testing.T) {
 
 // Test成员角色取值不自洽归入ErrInvalidMembershipRoleRecord
 //
-// 撞上 chk_membership_roles_* 说明状态与时间戳已经漂移
+// 撞上 chk_membership_roles_status 说明状态取值与领域层已经漂移
 // （通常是有人绕过了构造函数与状态转换方法直接改字段）。
 // 它必须变成可归类的领域错误，否则只能以驱动原生错误的形式冒到上层。
+//
+// 注意这条约束仍归记录级错误：领域层没有同口径的字段级错误，
+// 详见 membershipRoleWriteTargets 里的分流说明。
 func Test成员角色取值不自洽归入ErrInvalidMembershipRoleRecord(t *testing.T) {
 	r := newTestMembershipRole(t)
-	err := fmt.Errorf("new row violates check constraint %q: %w",
-		"chk_membership_roles_expires_after_effective", gorm.ErrCheckConstraintViolated)
+	err := pgConstraintError("23514", "chk_membership_roles_status", gorm.ErrCheckConstraintViolated)
 
 	got := translateMembershipRoleWriteError(err, r)
 	if !errors.Is(got, membershiprole.ErrInvalidMembershipRoleRecord) {

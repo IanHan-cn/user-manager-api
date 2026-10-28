@@ -175,6 +175,43 @@ func Test空实体错误不混入业务分类(t *testing.T) {
 	}
 }
 
+// Test主键重复错误不混入业务分类
+//
+// 主键重复是写入本身的缺陷（ID 生成或重试逻辑的问题），
+// 不是调用方换个业务键就能解决的正常冲突。
+// 它与 ErrNilEntity 同理：不挂业务分类树，HTTP 层应映射为 500。
+//
+// 它同时必须与各聚合的"已存在"错误区分开：
+// 后者说的是业务键重复，前者说的是主键撞了。
+func Test主键重复错误不混入业务分类(t *testing.T) {
+	if !errors.Is(domain.ErrDuplicateID, domain.ErrDataIntegrity) {
+		t.Fatal("domain.ErrDuplicateID 未归类到 domain.ErrDataIntegrity")
+	}
+
+	business := map[string]error{
+		"ErrInvalidKey":    domain.ErrInvalidKey,
+		"ErrInvalidState":  domain.ErrInvalidState,
+		"ErrConflict":      domain.ErrConflict,
+		"ErrNotFound":      domain.ErrNotFound,
+		"ErrAlreadyExists": domain.ErrAlreadyExists,
+	}
+	for name, base := range business {
+		t.Run(name, func(t *testing.T) {
+			if errors.Is(domain.ErrDuplicateID, base) {
+				t.Fatalf("主键重复不应归类到 %s", name)
+			}
+		})
+	}
+
+	// 与各聚合的"已存在"错误必须互相可辨。
+	if errors.Is(membership.ErrMembershipExists, domain.ErrDuplicateID) {
+		t.Fatal("成员关系已存在不应被误判为主键重复")
+	}
+	if errors.Is(domain.ErrDuplicateID, membership.ErrMembershipExists) {
+		t.Fatal("主键重复不应被误判为成员关系已存在")
+	}
+}
+
 // Test名称上限只有一个来源
 //
 // 名称上限曾经在错误文案与 role、tenant 两个包里各写一份 255，

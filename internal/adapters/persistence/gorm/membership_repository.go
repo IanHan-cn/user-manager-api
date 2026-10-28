@@ -7,6 +7,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/memories-cn/user-management-api/internal/domain"
 	"github.com/memories-cn/user-management-api/internal/domain/membership"
 	"gorm.io/gorm"
 )
@@ -134,6 +135,34 @@ func membershipWriteTargets(m *membership.Membership) writeTargets {
 		conflictIdentity: fmt.Sprintf("tenant_id=%s user_id=%s", m.TenantID, m.UserID),
 		invalid:          membership.ErrInvalidMembershipRecord,
 		invalidIdentity:  fmt.Sprintf("id=%s status=%s", m.ID, m.Status),
+		byConstraint: map[string]constraintOutcome{
+			// 主键重复是写入本身的缺陷，与"成员关系已存在"无关。
+			"memberships_pkey": {
+				err:      domain.ErrDuplicateID,
+				identity: fmt.Sprintf("id=%s", m.ID),
+			},
+			// 业务唯一索引：同一租户下同一用户只能有一条成员关系。
+			"idx_memberships_tenant_user": {
+				err:      membership.ErrMembershipExists,
+				identity: fmt.Sprintf("tenant_id=%s user_id=%s", m.TenantID, m.UserID),
+			},
+			// 字段级 CHECK：与领域层的同名字段错误同一口径。
+			"chk_memberships_invited_by_not_blank": {
+				err:      domain.ErrInvalidActor,
+				identity: fmt.Sprintf("invited_by=%s", m.InvitedBy),
+			},
+			// 下面两条领域层没有同口径的字段级错误：
+			// 状态取值域与状态时间戳自洽都只在绕过领域层时才会触发，
+			// 它们是两侧口径漂移的信号，仍归记录级错误。
+			"chk_memberships_status": {
+				err:      membership.ErrInvalidMembershipRecord,
+				identity: fmt.Sprintf("id=%s status=%s", m.ID, m.Status),
+			},
+			"chk_memberships_status_timestamps": {
+				err:      membership.ErrInvalidMembershipRecord,
+				identity: fmt.Sprintf("id=%s status=%s", m.ID, m.Status),
+			},
+		},
 	}
 }
 

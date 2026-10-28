@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/memories-cn/user-management-api/internal/domain"
 	domainuser "github.com/memories-cn/user-management-api/internal/domain/user"
 	"gorm.io/gorm"
 )
@@ -205,6 +206,26 @@ func userWriteTargets(u *domainuser.User) writeTargets {
 		conflictIdentity: fmt.Sprintf("id=%s zitadel_user_id=%s", u.ID, u.ZitadelUserID),
 		invalid:          domainuser.ErrInvalidUserRecord,
 		invalidIdentity:  fmt.Sprintf("id=%s", u.ID),
+		byConstraint: map[string]constraintOutcome{
+			// 主键重复是写入本身的缺陷，与"用户已存在"无关。
+			"users_pkey": {
+				err:      domain.ErrDuplicateID,
+				identity: fmt.Sprintf("id=%s", u.ID),
+			},
+			// 三条业务唯一索引：ZITADEL 账号、用户名与邮箱各自唯一。
+			"idx_users_zitadel_user_id": {
+				err:      domainuser.ErrUserExists,
+				identity: fmt.Sprintf("zitadel_user_id=%s", u.ZitadelUserID),
+			},
+			"idx_users_username": {
+				err:      domainuser.ErrUserExists,
+				identity: fmt.Sprintf("username=%s", u.Username),
+			},
+			"idx_users_email": {
+				err:      domainuser.ErrUserExists,
+				identity: fmt.Sprintf("email=%s", u.Email),
+			},
+		},
 	}
 }
 

@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 	"uuid"
@@ -716,6 +717,10 @@ func Test成员角色重复授权同一角色返回已存在且撤销后可重�
 // 应用层由构造函数与 Approve 守护这一条，这里是数据库侧的兜底：
 // 绕过它们直接把 expires_at 改成等于 effective_at 时，
 // chk_membership_roles_expires_after_effective 必须拒绝。
+//
+// 拒绝时给出的错误必须与领域层同一口径（ErrInvalidEffectiveRange）：
+// 同一个非法取值从两条路径进来若给出不同的错误，
+// 上层按基类分流就会走到不同分支——这是按约束名分流存在的理由。
 func Test成员角色失效时间不晚于生效时间被数据库拒绝(t *testing.T) {
 	f := newIntegrationFixture(t)
 
@@ -728,8 +733,11 @@ func Test成员角色失效时间不晚于生效时间被数据库拒绝(t *test
 	grant.ExpiresAt = grant.EffectiveAt
 
 	err := f.memberRoles.Update(f.ctx, grant)
-	if !errors.Is(err, membershiprole.ErrInvalidMembershipRoleRecord) {
-		t.Fatalf("err = %v，期望被 CHECK 拒绝并归入 ErrInvalidMembershipRoleRecord", err)
+	if !errors.Is(err, membershiprole.ErrInvalidEffectiveRange) {
+		t.Fatalf("err = %v，期望被 CHECK 拒绝并归入 ErrInvalidEffectiveRange", err)
+	}
+	if !errors.Is(err, domain.ErrInvalidKey) {
+		t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
 	}
 
 	got, err := f.memberRoles.GetByID(f.ctx, mustParseUUID(t, grant.ID))
@@ -1066,5 +1074,70 @@ func Test成员角色Update不存在的行返回记录不存在(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("err = %v，应归类到 domain.ErrNotFound", err)
+	}
+}
+
+// Test成员角色主键冲突归入主键重复
+//
+// 主键重复与业务唯一冲突必须分开：
+// 前者是 ID 生成或重试逻辑的缺陷，后者是"该成员已持有该角色"。
+// 混为一谈会让排障去找业务键，而真正该查的是 ID。
+//
+// 这一条也只有真库能证明：约束名是驱动在报错时才给出的，
+// 单测里的伪造错误走不到这条路径。
+func Test成员角色主键冲突归入主键重复(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	grant := f.mustGrantRole(t, tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyOwner), time.Time{})
+
+	// 换一条全新的业务键，只复用主键：撞的应当是主键而不是业务唯一索引。
+	dup, err := membershiprole.NewSystem(tenantID, membershipID, f.mustCreateRole(t, tenantID, role.KeyAdmin), time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	dup.ID = grant.ID
+
+	err = f.memberRoles.Create(f.ctx, dup)
+	if !errors.Is(err, domain.ErrDuplicateID) {
+		t.Fatalf("err = %v，期望 domain.ErrDuplicateID", err)
+	}
+	// 关键断言：不能被误报成"该成员已持有该角色"。
+	if errors.Is(err, membershiprole.ErrMembershipRoleExists) {
+		t.Fatalf("err = %v，主键冲突不应被误报为已持有该角色", err)
+	}
+}
+
+// Test成员角色原因超长归入字段级错误
+//
+// 原因超长在领域层是 ErrInvalidReason（400 语义），
+// 从数据库 CHECK 兜底时也必须是同一个错误：
+// 同一语义给出两个状态码，上层没法统一归类。
+func Test成员角色原因超长归入字段级错误(t *testing.T) {
+	f := newIntegrationFixture(t)
+
+	tenantID := uuid.NewV7()
+	membershipID := f.mustCreateMembership(t, tenantID, uuid.NewV7())
+	roleID := f.mustCreateRole(t, tenantID, role.KeyOwner)
+
+	grant, err := membershiprole.NewSystem(tenantID, membershipID, roleID, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("构造授权失败：%v", err)
+	}
+	// 绕过领域层的校验，直接把超长的原因塞进实体：
+	// 这里要验的正是"领域层被绕过时，数据库 CHECK 兜底给出的是不是同一个错误"。
+	grant.Reason = strings.Repeat("理", 513)
+
+	err = f.memberRoles.Create(f.ctx, grant)
+	if !errors.Is(err, membershiprole.ErrInvalidReason) {
+		t.Fatalf("err = %v，期望 ErrInvalidReason", err)
+	}
+	if !errors.Is(err, domain.ErrInvalidKey) {
+		t.Fatalf("err = %v，应归类到 domain.ErrInvalidKey", err)
+	}
+	// 记录级错误是 409 语义，与字段级错误不能混。
+	if errors.Is(err, membershiprole.ErrInvalidMembershipRoleRecord) {
+		t.Fatalf("err = %v，字段级错误不应归入记录级错误", err)
 	}
 }

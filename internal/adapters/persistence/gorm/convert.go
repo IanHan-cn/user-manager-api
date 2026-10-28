@@ -53,7 +53,7 @@ func fromNullableTime(t *time.Time) time.Time {
 // toNullableString 把领域层的空串转成库里的 NULL。
 //
 // 与时间那一对同一口径：可空文本列以 NULL 表示"没填"，
-// 空串写进去会撞上 btrim(col) <> ” 一类的 CHECK
+// 空串写进去会撞上 btrim(col) <> '' 一类的 CHECK
 // （见 membership_roles.reason 与 chk_membership_roles_reason）。
 func toNullableString(s string) *string {
 	if s == "" {
